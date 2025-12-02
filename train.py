@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-High-Parameter LoRA Training - FIXED VERSION
-Only targets supported layers (Linear, Conv2d)
+High-Parameter LoRA Training - FIXED GRADIENT CLIPPING VERSION
 """
 
 import argparse
@@ -101,7 +100,7 @@ def parse_args():
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
-        "--num_train_epochs", type=int, default=40, help="Number of training epochs."
+        "--num_train_epochs", type=int, default=30, help="Number of training epochs."
     )
     parser.add_argument(
         "--max_train_steps",
@@ -118,7 +117,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=3e-5,
+        default=1e-4,
         help="Initial learning rate.",
     )
     parser.add_argument(
@@ -158,29 +157,29 @@ def parse_args():
         help="Epsilon value for the Adam optimizer",
     )
     parser.add_argument(
-        "--max_grad_norm", default=1.0, type=float, help="Max gradient norm."
+        "--max_grad_norm", default=0.5, type=float, help="Max gradient norm."
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="A seed for reproducible training."
     )
 
-    # LoRA parameters (INCREASED)
+    # LoRA parameters (OPTIMIZED)
     parser.add_argument(
         "--lora_rank",
         type=int,
-        default=128,
+        default=64,
         help="Rank of LoRA layers. Higher = more parameters.",
     )
     parser.add_argument(
         "--lora_alpha",
         type=int,
-        default=256,
+        default=128,
         help="Alpha parameter for LoRA scaling.",
     )
     parser.add_argument(
         "--lora_dropout",
         type=float,
-        default=0.15,
+        default=0.2,
         help="Dropout probability for LoRA layers to prevent overfitting.",
     )
     parser.add_argument(
@@ -196,12 +195,18 @@ def parse_args():
         default=True,
         help="Apply LoRA to text encoder for more parameters.",
     )
+    parser.add_argument(
+        "--clip_gradients",
+        action="store_true",
+        default=False,
+        help="Whether to clip gradients (disable when using mixed precision).",
+    )
 
     # System parameters
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="fp16",
+        default="bf16",
         choices=["no", "fp16", "bf16"],
         help="Whether to use mixed precision.",
     )
@@ -388,17 +393,6 @@ class CollateFn:
         }
 
 
-def get_all_linear_layer_names(model):
-    """Get names of all Linear layers in a model"""
-    linear_layers = []
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            linear_layers.append(name)
-        elif isinstance(module, torch.nn.Conv2d):
-            linear_layers.append(name)
-    return linear_layers
-
-
 def main():
     args = parse_args()
 
@@ -461,14 +455,13 @@ def main():
         else:
             print("XFormers not available, using default attention")
 
-    # Setup LoRA with maximum parameters (ONLY SUPPORTED LAYERS)
+    # Setup LoRA with optimized parameters
     print(f"\nSetting up LoRA with rank={args.lora_rank}, alpha={args.lora_alpha}")
 
-    # 1. UNet LoRA - only target Linear and Conv2d layers
+    # 1. UNet LoRA
     unet_lora_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
-        # SAFE target modules that PEFT supports
         target_modules=[
             # Linear layers (attention projections)
             "to_q",
@@ -499,8 +492,7 @@ def main():
         ],
         lora_dropout=args.lora_dropout,
         bias=args.lora_bias,
-        fan_in_fan_out=True,
-        init_lora_weights="gaussian",
+        fan_in_fan_out=False,  # Set to False for Linear layers
     )
 
     unet.add_adapter(unet_lora_config)
@@ -513,6 +505,7 @@ def main():
             target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
             lora_dropout=args.lora_dropout,
             bias=args.lora_bias,
+            fan_in_fan_out=False,
         )
         text_encoder.add_adapter(text_lora_config)
         print("Applied LoRA to text encoder")
@@ -645,6 +638,8 @@ def main():
     logger.info(f"  LoRA rank = {args.lora_rank}")
     logger.info(f"  LoRA alpha = {args.lora_alpha}")
     logger.info(f"  Learning rate = {args.learning_rate}")
+    logger.info(f"  Mixed precision = {args.mixed_precision}")
+    logger.info(f"  Gradient clipping = {args.clip_gradients}")
     logger.info(f"  Trainable parameters = {total_params:,}")
     logger.info("=" * 60)
 
@@ -666,78 +661,97 @@ def main():
 
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
-                # Convert target images to latent space
-                latents = vae.encode(
-                    batch["target_images"].to(dtype=weight_dtype)
-                ).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                # Use autocast for mixed precision
+                with torch.autocast(
+                    device_type="cuda" if torch.cuda.is_available() else "cpu",
+                    dtype=torch.float16
+                    if args.mixed_precision == "fp16"
+                    else torch.bfloat16
+                    if args.mixed_precision == "bf16"
+                    else torch.float32,
+                    enabled=args.mixed_precision != "no",
+                ):
+                    # Convert target images to latent space
+                    latents = vae.encode(
+                        batch["target_images"].to(dtype=weight_dtype)
+                    ).latent_dist.sample()
+                    latents = latents * vae.config.scaling_factor
 
-                # Convert masked images (erased images) to latent space
-                masked_latents = vae.encode(
-                    batch["masked_images"]
-                    .reshape(batch["target_images"].shape)
-                    .to(dtype=weight_dtype)
-                ).latent_dist.sample()
-                masked_latents = masked_latents * vae.config.scaling_factor
+                    # Convert masked images (erased images) to latent space
+                    masked_latents = vae.encode(
+                        batch["masked_images"]
+                        .reshape(batch["target_images"].shape)
+                        .to(dtype=weight_dtype)
+                    ).latent_dist.sample()
+                    masked_latents = masked_latents * vae.config.scaling_factor
 
-                # Resize masks to latent shape
-                masks = batch["masks"]
-                mask = torch.stack(
-                    [
-                        torch.nn.functional.interpolate(
-                            mask, size=(args.resolution // 8, args.resolution // 8)
-                        )
-                        for mask in masks
-                    ]
-                ).to(dtype=weight_dtype)
-                mask = mask.reshape(-1, 1, args.resolution // 8, args.resolution // 8)
-
-                # Sample noise
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-
-                # Sample timesteps
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (bsz,),
-                    device=latents.device,
-                ).long()
-
-                # Add noise to latents
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Concatenate for inpainting
-                latent_model_input = torch.cat(
-                    [noisy_latents, mask, masked_latents], dim=1
-                )
-
-                # Get text embeddings
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
-                # Predict noise
-                noise_pred = unet(
-                    latent_model_input, timesteps, encoder_hidden_states
-                ).sample
-
-                # Calculate loss
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(
-                        f"Unknown prediction type {noise_scheduler.config.prediction_type}"
+                    # Resize masks to latent shape
+                    masks = batch["masks"]
+                    mask = torch.stack(
+                        [
+                            torch.nn.functional.interpolate(
+                                mask, size=(args.resolution // 8, args.resolution // 8)
+                            )
+                            for mask in masks
+                        ]
+                    ).to(dtype=weight_dtype)
+                    mask = mask.reshape(
+                        -1, 1, args.resolution // 8, args.resolution // 8
                     )
 
-                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-                losses.append(loss.detach().item())
+                    # Sample noise
+                    noise = torch.randn_like(latents)
+                    bsz = latents.shape[0]
+
+                    # Sample timesteps
+                    timesteps = torch.randint(
+                        0,
+                        noise_scheduler.config.num_train_timesteps,
+                        (bsz,),
+                        device=latents.device,
+                    ).long()
+
+                    # Add noise to latents
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                    # Concatenate for inpainting
+                    latent_model_input = torch.cat(
+                        [noisy_latents, mask, masked_latents], dim=1
+                    )
+
+                    # Get text embeddings
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+
+                    # Predict noise
+                    noise_pred = unet(
+                        latent_model_input, timesteps, encoder_hidden_states
+                    ).sample
+
+                    # Calculate loss
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        target = noise
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        raise ValueError(
+                            f"Unknown prediction type {noise_scheduler.config.prediction_type}"
+                        )
+
+                    loss = F.mse_loss(
+                        noise_pred.float(), target.float(), reduction="mean"
+                    )
+                    losses.append(loss.detach().item())
 
                 # Backward pass
                 accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = trainable_params
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                # Gradient clipping - only if enabled AND not using mixed precision
+                if (
+                    accelerator.sync_gradients
+                    and args.clip_gradients
+                    and args.mixed_precision == "no"
+                ):
+                    accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -747,11 +761,6 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-
-                # Log average loss
-                if len(losses) > 0:
-                    avg_loss = sum(losses) / len(losses)
-                    losses = []  # Reset
 
                 # Save checkpoint
                 if (
@@ -767,6 +776,12 @@ def main():
                     unet.save_attn_procs(os.path.join(save_path, "lora_weights"))
 
                     logger.info(f"Saved checkpoint to {save_path}")
+
+                    # Save loss history
+                    if losses:
+                        avg_loss = sum(losses) / len(losses)
+                        logger.info(f"  Average loss: {avg_loss:.4f}")
+                        losses = []  # Reset
 
             # Log
             logs = {
@@ -809,6 +824,22 @@ def main():
                 os.path.join(args.output_dir, "text_encoder_lora")
             )
             print(f"Saved text encoder LoRA to {args.output_dir}/text_encoder_lora")
+
+        # Save training summary
+        import json
+
+        summary = {
+            "total_steps": global_step,
+            "total_params": total_params,
+            "lora_rank": args.lora_rank,
+            "lora_alpha": args.lora_alpha,
+            "learning_rate": args.learning_rate,
+            "num_epochs": args.num_train_epochs,
+            "batch_size": args.train_batch_size,
+        }
+        with open(os.path.join(args.output_dir, "training_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Saved training summary to {args.output_dir}/training_summary.json")
 
         print("=" * 60)
 
