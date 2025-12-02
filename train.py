@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stable Diffusion Fine-Tuning - Simple attention layer training
+Stable Diffusion Fine-Tuning - Fixed version
 """
 
 import argparse
@@ -186,13 +186,13 @@ class StableDiffusionDataset(Dataset):
 
 
 # ============================================================================
-# SETUP MODELS - NO LoRA, JUST ATTENTION LAYER TRAINING
+# SETUP MODELS - FIXED VERSION
 # ============================================================================
 
 
-def setup_models_simple(args):
-    """Simple setup - train only attention projection layers"""
-    print("Setting up models for simple fine-tuning...")
+def setup_models_fixed(args):
+    """FIXED setup - train the entire UNet or specific blocks"""
+    print("Setting up models...")
 
     # Load tokenizer
     tokenizer = CLIPTokenizer.from_pretrained(args.model_name, subfolder="tokenizer")
@@ -213,42 +213,52 @@ def setup_models_simple(args):
     unet = UNet2DConditionModel.from_pretrained(args.model_name, subfolder="unet")
     unet.to(args.device)
 
-    # Check UNet configuration
-    print(f"UNet sample size: {unet.config.sample_size}")
-    print(f"UNet in channels: {unet.config.in_channels}")
+    # OPTION 1: Train entire UNet (simplest, works)
+    if args.train_entire_unet:
+        print("Training entire UNet (all parameters)...")
+        unet.requires_grad_(True)  # Train everything
+        trainable_params = list(unet.parameters())
 
-    # Freeze all UNet parameters first
-    unet.requires_grad_(False)
+    # OPTION 2: Train only specific blocks
+    else:
+        print("Training selected UNet blocks...")
 
-    # Unfreeze only attention projection layers (like what LoRA would train)
-    trainable_params = []
+        # First freeze everything
+        unet.requires_grad_(False)
 
-    # List of attention layer patterns to train
-    attention_patterns = [
-        "to_q",  # Query projection
-        "to_k",  # Key projection
-        "to_v",  # Value projection
-        "to_out",  # Output projection
-        "proj_out",  # Another output projection variant
-        "proj_in",  # Input projection
-    ]
+        # Unfreeze specific components - AVOID partial freezing of attention layers
+        # The error happens when we freeze some parts but not others of the same layer
 
-    for name, param in unet.named_parameters():
-        # Check if this parameter is part of an attention layer
-        if any(pattern in name for pattern in attention_patterns):
-            param.requires_grad = True
-            trainable_params.append(param)
-            # print(f"Training: {name}")  # Uncomment to see which layers are trained
+        # Safer approach: Unfreeze entire attention blocks or nothing
+        trainable_params = []
 
-    print(f"Training {len(trainable_params)} attention layers")
-    print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+        # Pattern 1: Unfreeze entire attention blocks by name pattern
+        unfreeze_patterns = [
+            "attentions",  # All attention blocks
+            "resnets",  # All residual blocks
+            "upsamplers",  # Upsampling blocks
+            "downsamplers",  # Downsampling blocks
+        ]
 
-    # Count total parameters for comparison
+        for name, param in unet.named_parameters():
+            # Check if this parameter belongs to a block we want to train
+            should_train = any(pattern in name for pattern in unfreeze_patterns)
+
+            # Also train cross-attention layers if using text conditioning
+            if args.use_text_conditioning and ("attn2" in name or "cross_attn" in name):
+                should_train = True
+
+            if should_train:
+                param.requires_grad = True
+                trainable_params.append(param)
+
+    # Count parameters
     total_params = sum(p.numel() for p in unet.parameters())
+    trainable_count = sum(p.numel() for p in trainable_params)
+
     print(f"Total UNet parameters: {total_params:,}")
-    print(
-        f"Training percentage: {sum(p.numel() for p in trainable_params) / total_params * 100:.2f}%"
-    )
+    print(f"Trainable parameters: {trainable_count:,}")
+    print(f"Training percentage: {trainable_count / total_params * 100:.2f}%")
 
     # Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
@@ -259,17 +269,17 @@ def setup_models_simple(args):
 
 
 # ============================================================================
-# TRAINING FUNCTION - SIMPLE NO LoRA
+# TRAINING FUNCTION - FIXED
 # ============================================================================
 
 
-def train_simple(args):
-    """Simple training without LoRA complexity"""
-    print("Starting simple fine-tuning (attention layers only)...")
+def train_fixed(args):
+    """Fixed training function"""
+    print("Starting training...")
 
     # Setup models
     tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params = (
-        setup_models_simple(args)
+        setup_models_fixed(args)
     )
 
     # Training dataset
@@ -289,18 +299,13 @@ def train_simple(args):
 
     print(f"Training on {len(train_dataset)} samples")
     print(f"Image size: {args.image_size}x{args.image_size}")
-    print(
-        f"Latent size: {args.image_size // 8}x{args.image_size // 8} (downsample factor 8)"
-    )
 
     # Optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
 
-    # Learning rate scheduler (optional)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs * len(train_dataloader),
-        eta_min=args.learning_rate * 0.1,
+    # Simple learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=3, verbose=True
     )
 
     # Create checkpoint directory
@@ -313,19 +318,11 @@ def train_simple(args):
         f.write("=" * 50 + "\n")
         for key, value in vars(args).items():
             f.write(f"{key}: {value}\n")
-        f.write(
-            f"\nTrainable parameters: {sum(p.numel() for p in trainable_params):,}\n"
-        )
-        f.write(f"Image size: {args.image_size}x{args.image_size}\n")
-        f.write(f"Dataset size: {len(train_dataset)} samples\n")
 
     # Training loop
     unet.train()
     best_loss = float("inf")
-
-    # Track training history
     train_loss_history = []
-    lr_history = []
 
     for epoch in range(args.epochs):
         epoch_loss = 0
@@ -338,15 +335,27 @@ def train_simple(args):
 
             # Encode images to latent space
             with torch.no_grad():
+                # Debug: Print shapes
+                if batch_idx == 0 and epoch == 0:
+                    print(f"\nDebug - Input shape: {original.shape}")
+
                 # Encode to latents
                 latents_original = vae.encode(original).latent_dist.sample()
 
-                # Scale latents (standard SD practice)
+                # Debug: Print latent shape
+                if batch_idx == 0 and epoch == 0:
+                    print(f"Debug - Latent shape: {latents_original.shape}")
+
+                # Scale latents
                 latents_original = latents_original * 0.18215
 
                 # Get text embeddings
                 if args.use_text_conditioning:
                     encoder_hidden_states = text_encoder(input_ids)[0]
+                    if batch_idx == 0 and epoch == 0:
+                        print(
+                            f"Debug - Text embeddings shape: {encoder_hidden_states.shape}"
+                        )
                 else:
                     encoder_hidden_states = None
 
@@ -366,10 +375,31 @@ def train_simple(args):
                 latents_original, noise, timesteps
             )
 
-            # Predict noise
-            noise_pred = unet(
-                noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states
-            ).sample
+            # Debug: Print noisy latents shape
+            if batch_idx == 0 and epoch == 0:
+                print(f"Debug - Noisy latents shape: {noisy_latents.shape}")
+                print(f"Debug - Timesteps shape: {timesteps.shape}")
+
+            # Predict noise - THIS IS WHERE THE ERROR WAS
+            try:
+                noise_pred = unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                ).sample
+
+                # Debug: Print noise prediction shape
+                if batch_idx == 0 and epoch == 0:
+                    print(f"Debug - Noise prediction shape: {noise_pred.shape}")
+
+            except RuntimeError as e:
+                print(f"\nERROR in forward pass: {e}")
+                print("This indicates dimension mismatch in UNet")
+                print("Troubleshooting tips:")
+                print("1. Try --train_entire_unet flag to train all parameters")
+                print("2. Check that image_size is appropriate (64, 128, 256, 512)")
+                print("3. Try different batch_size")
+                raise e
 
             # Calculate loss
             loss = F.mse_loss(noise_pred, noise)
@@ -378,30 +408,25 @@ def train_simple(args):
             optimizer.zero_grad()
             loss.backward()
 
-            # Gradient clipping for stability
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
 
             optimizer.step()
-            scheduler.step()
 
             # Update metrics
             epoch_loss += loss.item()
-            current_lr = scheduler.get_last_lr()[0]
-            lr_history.append(current_lr)
 
-            # Print debug info for first batch of first epoch
-            if batch_idx == 0 and epoch == 0:
-                print(f"\nDebug info (first batch):")
-                print(f"  Original shape: {original.shape}")
-                print(f"  Latents shape: {latents_original.shape}")
-                print(f"  Noise pred shape: {noise_pred.shape}")
-                print(f"  Loss: {loss.item():.4f}")
-
-            progress_bar.set_postfix({"loss": loss.item(), "lr": f"{current_lr:.2e}"})
+            progress_bar.set_postfix(
+                {"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"]}
+            )
 
         avg_loss = epoch_loss / len(train_dataloader)
         train_loss_history.append(avg_loss)
-        print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}, LR: {current_lr:.2e}")
+
+        # Update scheduler
+        scheduler.step(avg_loss)
+
+        print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}")
 
         # Save checkpoint
         if (epoch + 1) % args.save_every_n_epochs == 0:
@@ -415,11 +440,9 @@ def train_simple(args):
                     "epoch": epoch,
                     "unet_state_dict": unet.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
                     "loss": avg_loss,
                     "args": vars(args),
                     "train_loss_history": train_loss_history,
-                    "lr_history": lr_history,
                 },
                 checkpoint_path,
             )
@@ -448,11 +471,9 @@ def train_simple(args):
         {
             "epoch": args.epochs,
             "unet_state_dict": unet.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
             "loss": avg_loss,
             "args": vars(args),
             "train_loss_history": train_loss_history,
-            "lr_history": lr_history,
         },
         final_path,
     )
@@ -460,23 +481,13 @@ def train_simple(args):
 
     # Plot training history
     if args.plot_training_history:
-        plt.figure(figsize=(12, 4))
-
-        plt.subplot(1, 2, 1)
+        plt.figure(figsize=(8, 4))
         plt.plot(train_loss_history)
         plt.title("Training Loss")
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
         plt.grid(True)
 
-        plt.subplot(1, 2, 2)
-        plt.plot(lr_history[: len(lr_history) // 10])  # Plot first 10% of LR history
-        plt.title("Learning Rate Schedule")
-        plt.xlabel("Step")
-        plt.ylabel("Learning Rate")
-        plt.grid(True)
-
-        plt.tight_layout()
         plot_path = os.path.join(args.checkpoint_dir, "training_history.png")
         plt.savefig(plot_path, dpi=150)
         print(f"Training history plot saved to {plot_path}")
@@ -488,30 +499,151 @@ def train_simple(args):
 
 
 # ============================================================================
-# EVALUATION FUNCTION
+# MINIMAL WORKING VERSION - TRAIN ENTIRE UNET
 # ============================================================================
 
 
-def evaluate_model(model_path, args):
-    """Evaluate trained model"""
-    print(f"Evaluating model from {model_path}")
+def train_minimal(args):
+    """Minimal working version - train entire UNet"""
+    print("Starting minimal training (entire UNet)...")
 
-    # Load tokenizer
+    # Simple setup
     tokenizer = CLIPTokenizer.from_pretrained(args.model_name, subfolder="tokenizer")
-
-    # Load UNet
+    text_encoder = CLIPTextModel.from_pretrained(
+        args.model_name, subfolder="text_encoder"
+    )
+    vae = AutoencoderKL.from_pretrained(args.model_name, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.model_name, subfolder="unet")
+
+    # Move to device
+    text_encoder.to(args.device)
+    vae.to(args.device)
     unet.to(args.device)
 
-    # Load trained weights
-    checkpoint = torch.load(model_path, map_location=args.device)
-    unet.load_state_dict(checkpoint["unet_state_dict"])
+    # Freeze text encoder and VAE
+    text_encoder.requires_grad_(False)
+    vae.requires_grad_(False)
 
-    print(f"Model loaded from epoch {checkpoint.get('epoch', 'unknown')}")
-    print(f"Training loss: {checkpoint.get('loss', 'unknown'):.4f}")
+    # Train entire UNet (no partial freezing)
+    trainable_params = list(unet.parameters())
+    print(
+        f"Training entire UNet: {sum(p.numel() for p in trainable_params):,} parameters"
+    )
 
-    # You can add evaluation logic here
-    # For example, generate some test images
+    # Noise scheduler
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        args.model_name, subfolder="scheduler"
+    )
+
+    # Training dataset
+    train_dataset = StableDiffusionDataset(
+        data_path=args.train_data,
+        tokenizer=tokenizer,
+        image_size=args.image_size,
+        is_test=False,
+    )
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+
+    # Create checkpoint directory
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    # Training loop
+    unet.train()
+
+    for epoch in range(args.epochs):
+        epoch_loss = 0
+        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+
+        for batch_idx, batch in enumerate(progress_bar):
+            # Move to device
+            original = batch["original"].to(args.device)
+            input_ids = batch["input_ids"].to(args.device)
+
+            # Encode images to latent space
+            with torch.no_grad():
+                latents_original = vae.encode(original).latent_dist.sample()
+                latents_original = latents_original * 0.18215
+
+                # Get text embeddings
+                if args.use_text_conditioning:
+                    encoder_hidden_states = text_encoder(input_ids)[0]
+                else:
+                    encoder_hidden_states = None
+
+            # Sample noise
+            noise = torch.randn_like(latents_original)
+
+            # Sample timestep
+            timesteps = torch.randint(
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (latents_original.shape[0],),
+                device=args.device,
+            ).long()
+
+            # Add noise to latents
+            noisy_latents = noise_scheduler.add_noise(
+                latents_original, noise, timesteps
+            )
+
+            # Predict noise - Should work now
+            noise_pred = unet(
+                noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states
+            ).sample
+
+            # Calculate loss
+            loss = F.mse_loss(noise_pred, noise)
+
+            # Backprop
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Update metrics
+            epoch_loss += loss.item()
+
+            progress_bar.set_postfix({"loss": loss.item()})
+
+        avg_loss = epoch_loss / len(train_dataloader)
+        print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}")
+
+        # Save checkpoint
+        if (epoch + 1) % args.save_every_n_epochs == 0:
+            checkpoint_path = os.path.join(
+                args.checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt"
+            )
+
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "unet_state_dict": unet.state_dict(),
+                    "loss": avg_loss,
+                },
+                checkpoint_path,
+            )
+            print(f"Checkpoint saved to {checkpoint_path}")
+
+    print("Training completed!")
+
+    # Save final model
+    final_path = os.path.join(args.checkpoint_dir, "final_model.pt")
+    torch.save(
+        {
+            "unet_state_dict": unet.state_dict(),
+            "args": vars(args),
+        },
+        final_path,
+    )
+    print(f"Final model saved to {final_path}")
 
     return unet
 
@@ -522,17 +654,11 @@ def evaluate_model(model_path, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune Stable Diffusion (No LoRA)")
+    parser = argparse.ArgumentParser(description="Fine-tune Stable Diffusion")
 
     # Dataset paths
     parser.add_argument(
         "--train_data", type=str, required=True, help="Path to training dataset"
-    )
-    parser.add_argument(
-        "--eval_data",
-        type=str,
-        default=None,
-        help="Path to evaluation dataset (optional)",
     )
 
     # Model settings
@@ -549,7 +675,17 @@ def main():
         "--image_size",
         type=int,
         default=64,
-        help="Image size for training (default: 64)",
+        help="Image size for training",
+    )
+    parser.add_argument(
+        "--train_entire_unet",
+        action="store_true",
+        help="Train entire UNet (recommended to avoid dimension errors)",
+    )
+    parser.add_argument(
+        "--minimal",
+        action="store_true",
+        help="Use minimal training (train entire UNet, simplest)",
     )
 
     # Training hyperparameters
@@ -581,14 +717,6 @@ def main():
         "--show_plots", action="store_true", help="Show plots during training"
     )
 
-    # Evaluation mode
-    parser.add_argument(
-        "--evaluate", action="store_true", help="Evaluate instead of train"
-    )
-    parser.add_argument(
-        "--model_path", type=str, default=None, help="Path to model for evaluation"
-    )
-
     # System settings
     parser.add_argument(
         "--num_workers", type=int, default=2, help="Number of data loader workers"
@@ -614,14 +742,13 @@ def main():
     for key, value in vars(args).items():
         print(f"  {key}: {value}")
 
-    # Run training or evaluation
-    if args.evaluate:
-        if not args.model_path:
-            print("Error: --model_path required for evaluation")
-            return
-        evaluate_model(args.model_path, args)
+    # Choose training method
+    if args.minimal:
+        print("\nUsing minimal training (entire UNet)...")
+        train_minimal(args)
     else:
-        train_simple(args)
+        print("\nUsing fixed training...")
+        train_fixed(args)
 
 
 if __name__ == "__main__":
