@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-High-Parameter LoRA Training for Inpainting
-With maximum trainable parameters for better performance
+High-Parameter LoRA Training - FIXED VERSION
+Only targets supported layers (Linear, Conv2d)
 """
 
 import argparse
@@ -196,12 +196,6 @@ def parse_args():
         default=True,
         help="Apply LoRA to text encoder for more parameters.",
     )
-    parser.add_argument(
-        "--apply_lora_to_vae",
-        action="store_true",
-        default=False,
-        help="Apply LoRA to VAE for even more parameters.",
-    )
 
     # System parameters
     parser.add_argument(
@@ -235,19 +229,6 @@ def parse_args():
         default=True,
         help="Whether or not to use xformers.",
     )
-    parser.add_argument(
-        "--validation_steps",
-        type=int,
-        default=1000,
-        help="Run validation every X steps.",
-    )
-    parser.add_argument(
-        "--validation_prompts",
-        type=str,
-        nargs="+",
-        default=["emoji 6", "emoji 100", "emoji 42"],
-        help="Prompts for validation during training.",
-    )
 
     args = parser.parse_args()
 
@@ -260,7 +241,6 @@ def parse_args():
 class InpaintingDataset(Dataset):
     """
     Dataset for inpainting training with your folder structure.
-    Expects: train_data_dir/erased/, train_data_dir/masks/, train_data_dir/orig/
     """
 
     def __init__(
@@ -408,92 +388,15 @@ class CollateFn:
         }
 
 
-def create_extended_lora_config(args, model_type="unet"):
-    """Create LoRA configuration with maximum parameters"""
-
-    if model_type == "unet":
-        # Extended target modules for UNet
-        target_modules = [
-            # Attention layers
-            "to_q",
-            "to_k",
-            "to_v",
-            "to_out.0",
-            "attn1.to_q",
-            "attn1.to_k",
-            "attn1.to_v",
-            "attn1.to_out.0",
-            "attn2.to_q",
-            "attn2.to_k",
-            "attn2.to_v",
-            "attn2.to_out.0",
-            # Feed-forward layers
-            "ff.net.0.proj",
-            "ff.net.2",
-            # Convolution layers
-            "conv1",
-            "conv2",
-            "conv_shortcut",
-            "conv_in",
-            "conv_out",
-            "conv_norm_out",
-            # Time embeddings
-            "time_emb_proj",
-            # Normalization layers
-            "norm1",
-            "norm2",
-            "norm3",
-            "group_norm",
-            "layer_norm",
-            # Resnet and transformer blocks
-            "resnet.*.conv1",
-            "resnet.*.conv2",
-            "transformer_blocks.*.attn1.to_q",
-            "transformer_blocks.*.attn1.to_k",
-            "transformer_blocks.*.attn1.to_v",
-            "transformer_blocks.*.attn1.to_out.0",
-            "transformer_blocks.*.attn2.to_q",
-            "transformer_blocks.*.attn2.to_k",
-            "transformer_blocks.*.attn2.to_v",
-            "transformer_blocks.*.attn2.to_out.0",
-            "transformer_blocks.*.ff.net.0.proj",
-            "transformer_blocks.*.ff.net.2",
-        ]
-        rank = args.lora_rank
-        alpha = args.lora_alpha
-
-    elif model_type == "text_encoder":
-        # For text encoder
-        target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
-        rank = args.lora_rank // 2  # Smaller rank for text encoder
-        alpha = args.lora_alpha // 2
-
-    elif model_type == "vae":
-        # For VAE
-        target_modules = [
-            "conv_in",
-            "conv_out",
-            "conv_norm_out",
-            "mid_block.*",
-            "up_blocks.*.conv",
-            "down_blocks.*.conv",
-            "encoder.conv_in",
-            "encoder.conv_out",
-            "decoder.conv_in",
-            "decoder.conv_out",
-        ]
-        rank = args.lora_rank // 4  # Even smaller for VAE
-        alpha = args.lora_alpha // 4
-
-    return LoraConfig(
-        r=rank,
-        lora_alpha=alpha,
-        target_modules=target_modules,
-        lora_dropout=args.lora_dropout,
-        bias=args.lora_bias,
-        fan_in_fan_out=True,
-        init_lora_weights="gaussian",
-    )
+def get_all_linear_layer_names(model):
+    """Get names of all Linear layers in a model"""
+    linear_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            linear_layers.append(name)
+        elif isinstance(module, torch.nn.Conv2d):
+            linear_layers.append(name)
+    return linear_layers
 
 
 def main():
@@ -558,41 +461,72 @@ def main():
         else:
             print("XFormers not available, using default attention")
 
-    # Setup LoRA with maximum parameters
+    # Setup LoRA with maximum parameters (ONLY SUPPORTED LAYERS)
     print(f"\nSetting up LoRA with rank={args.lora_rank}, alpha={args.lora_alpha}")
 
-    # 1. UNet LoRA (main model)
-    unet_lora_config = create_extended_lora_config(args, "unet")
+    # 1. UNet LoRA - only target Linear and Conv2d layers
+    unet_lora_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        # SAFE target modules that PEFT supports
+        target_modules=[
+            # Linear layers (attention projections)
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "attn1.to_q",
+            "attn1.to_k",
+            "attn1.to_v",
+            "attn1.to_out.0",
+            "attn2.to_q",
+            "attn2.to_k",
+            "attn2.to_v",
+            "attn2.to_out.0",
+            # Linear layers (feed-forward)
+            "ff.net.0.proj",
+            "ff.net.2",
+            # Conv2d layers (residual blocks)
+            "conv1",
+            "conv2",
+            "conv_shortcut",
+            # Input/output conv layers
+            "conv_in",
+            "conv_out",
+            # Proj layers (usually linear)
+            "proj_in",
+            "proj_out",
+        ],
+        lora_dropout=args.lora_dropout,
+        bias=args.lora_bias,
+        fan_in_fan_out=True,
+        init_lora_weights="gaussian",
+    )
+
     unet.add_adapter(unet_lora_config)
 
-    # 2. Text encoder LoRA (optional, adds more parameters)
+    # 2. Text encoder LoRA (optional)
     if args.apply_lora_to_text_encoder:
-        text_lora_config = create_extended_lora_config(args, "text_encoder")
+        text_lora_config = LoraConfig(
+            r=args.lora_rank // 2,
+            lora_alpha=args.lora_alpha // 2,
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+            lora_dropout=args.lora_dropout,
+            bias=args.lora_bias,
+        )
         text_encoder.add_adapter(text_lora_config)
         print("Applied LoRA to text encoder")
-
-    # 3. VAE LoRA (optional, adds even more parameters)
-    if args.apply_lora_to_vae:
-        vae_lora_config = create_extended_lora_config(args, "vae")
-        vae.add_adapter(vae_lora_config)
-        print("Applied LoRA to VAE")
 
     # Set models to train mode
     unet.train()
     if args.apply_lora_to_text_encoder:
         text_encoder.train()
-    if args.apply_lora_to_vae:
-        vae.train()
 
     # Collect all trainable parameters
     trainable_params = []
     param_counts = {}
 
-    for model_name, model in [
-        ("unet", unet),
-        ("text_encoder", text_encoder),
-        ("vae", vae),
-    ]:
+    for model_name, model in [("unet", unet), ("text_encoder", text_encoder)]:
         model_params = 0
         for name, param in model.named_parameters():
             if "lora" in name.lower():
@@ -609,8 +543,6 @@ def main():
     print(f"UNet LoRA parameters: {param_counts['unet']:,}")
     if args.apply_lora_to_text_encoder:
         print(f"Text Encoder LoRA parameters: {param_counts['text_encoder']:,}")
-    if args.apply_lora_to_vae:
-        print(f"VAE LoRA parameters: {param_counts['vae']:,}")
     print(f"TOTAL trainable parameters: {total_params:,}")
     print(f"Number of parameter tensors: {len(trainable_params)}")
 
@@ -676,9 +608,7 @@ def main():
     )
 
     # Prepare with accelerator
-    if args.apply_lora_to_text_encoder and args.apply_lora_to_vae:
-        models = [unet, text_encoder, vae]
-    elif args.apply_lora_to_text_encoder:
+    if args.apply_lora_to_text_encoder:
         models = [unet, text_encoder]
     else:
         models = [unet]
@@ -733,8 +663,6 @@ def main():
         unet.train()
         if args.apply_lora_to_text_encoder:
             text_encoder.train()
-        if args.apply_lora_to_vae:
-            vae.train()
 
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
@@ -802,15 +730,7 @@ def main():
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
 
-                # Option 1: Standard MSE loss
                 loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-
-                # Option 2: Mask-weighted loss (uncomment to use)
-                # mask_flat = mask.flatten(1)
-                # loss_per_pixel = F.mse_loss(noise_pred.float(), target.float(), reduction='none')
-                # loss_per_pixel = loss_per_pixel.mean(dim=1).flatten(1)
-                # loss = (loss_per_pixel * mask_flat).sum() / mask_flat.sum().clamp(min=1)
-
                 losses.append(loss.detach().item())
 
                 # Backward pass
@@ -842,18 +762,11 @@ def main():
                         args.output_dir, f"checkpoint-{global_step}"
                     )
                     accelerator.save_state(save_path)
-                    logger.info(f"Saved checkpoint to {save_path}")
 
                     # Save LoRA weights separately
                     unet.save_attn_procs(os.path.join(save_path, "lora_weights"))
 
-                    # Save PEFT state dict
-                    if accelerator.is_main_process:
-                        peft_state_dict = get_peft_model_state_dict(unet)
-                        torch.save(
-                            peft_state_dict,
-                            os.path.join(save_path, "peft_lora_weights.safetensors"),
-                        )
+                    logger.info(f"Saved checkpoint to {save_path}")
 
             # Log
             logs = {
@@ -897,19 +810,6 @@ def main():
             )
             print(f"Saved text encoder LoRA to {args.output_dir}/text_encoder_lora")
 
-        # Save training config
-        import json
-
-        config = {
-            "args": vars(args),
-            "total_trainable_parameters": total_params,
-            "training_steps": global_step,
-            "final_loss": loss.item() if "loss" in locals() else None,
-        }
-        with open(os.path.join(args.output_dir, "training_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
-
-        print(f"Saved training config to {args.output_dir}/training_config.json")
         print("=" * 60)
 
     accelerator.end_training()
