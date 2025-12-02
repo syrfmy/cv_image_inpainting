@@ -318,51 +318,57 @@ class InpaintingDataset(Dataset):
         }
 
 
-def collate_fn(examples):
-    """Collate function for the dataloader"""
-    input_ids = [example["prompt_ids"] for example in examples]
-    pixel_values = [
-        example["orig_image"] for example in examples
-    ]  # Use original as target
+class CollateFn:
+    """Collate function class that holds the tokenizer"""
 
-    # Convert images to tensors
-    pixel_values = [transforms.ToTensor()(img) for img in pixel_values]
-    pixel_values = [transforms.Normalize([0.5], [0.5])(img) for img in pixel_values]
-    pixel_values = torch.stack(pixel_values)
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
 
-    # Prepare masks and masked images (erased images)
-    masks = []
-    masked_images = []
+    def __call__(self, examples):
+        """Collate function for the dataloader"""
+        input_ids = [example["prompt_ids"] for example in examples]
+        pixel_values = [
+            example["orig_image"] for example in examples
+        ]  # Use original as target
 
-    for example in examples:
-        orig_pil = example["orig_image"]
-        erased_pil = example["erased_image"]
-        mask_pil = example["mask"]
+        # Convert images to tensors
+        pixel_values = [transforms.ToTensor()(img) for img in pixel_values]
+        pixel_values = [transforms.Normalize([0.5], [0.5])(img) for img in pixel_values]
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-        # Resize mask to match image size
-        mask_pil = mask_pil.resize(orig_pil.size, Image.NEAREST)
+        # Prepare masks and masked images (erased images)
+        masks = []
+        masked_images = []
 
-        # Prepare mask and masked image
-        mask, masked_image = prepare_mask_and_masked_image(orig_pil, mask_pil)
+        for example in examples:
+            orig_pil = example["orig_image"]
+            erased_pil = example["erased_image"]
+            mask_pil = example["mask"]
 
-        masks.append(mask)
-        masked_images.append(masked_image)
+            # Resize mask to match image size
+            mask_pil = mask_pil.resize(orig_pil.size, Image.NEAREST)
 
-    masks = torch.stack(masks)
-    masked_images = torch.stack(masked_images)
+            # Prepare mask and masked image
+            mask, masked_image = prepare_mask_and_masked_image(orig_pil, mask_pil)
 
-    # Pad input_ids
-    input_ids = tokenizer.pad(
-        {"input_ids": input_ids}, padding=True, return_tensors="pt"
-    ).input_ids
+            masks.append(mask)
+            masked_images.append(masked_image)
 
-    return {
-        "input_ids": input_ids,
-        "pixel_values": pixel_values,
-        "masks": masks,
-        "masked_images": masked_images,
-    }
+        masks = torch.stack(masks)
+        masked_images = torch.stack(masked_images)
+
+        # Pad input_ids
+        input_ids = self.tokenizer.pad(
+            {"input_ids": input_ids}, padding=True, return_tensors="pt"
+        ).input_ids
+
+        return {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "masks": masks,
+            "masked_images": masked_images,
+        }
 
 
 def main():
@@ -427,9 +433,6 @@ def main():
             raise ValueError("xformers is not available")
 
     # Setup LoRA using PEFT
-    # First, import the necessary function from diffusers
-    from diffusers.loaders import UNet2DConditionLoadersMixin
-
     # Create LoRA config
     lora_config = LoraConfig(
         r=args.lora_rank,
@@ -439,8 +442,7 @@ def main():
         bias=args.lora_bias,
     )
 
-    # Alternatively, we can use diffusers' built-in method for adding LoRA
-    # This is the recommended way in newer versions of diffusers
+    # Add LoRA adapter to UNet
     unet.add_adapter(lora_config)
 
     # Now only LoRA parameters are trainable
@@ -487,12 +489,15 @@ def main():
         center_crop=False,
     )
 
+    # Create collate function
+    collate_fn_instance = CollateFn(tokenizer)
+
     # Create dataloader
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_instance,
         num_workers=2,
     )
 
