@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Stable Diffusion LoRA Training - Adapted for your dataset structure
+Updated to use PEFT library instead of deprecated LoRAAttnProcessor
 """
 
 import argparse
@@ -18,8 +19,11 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from diffusers.loaders import AttnProcsLayers
-from diffusers.models.attention_processor import LoRAAttnProcessor
 from diffusers.optimization import get_scheduler
+
+# PEFT imports
+from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -48,7 +52,9 @@ def prepare_mask_and_masked_image(image, mask):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LoRA Training for Inpainting")
+    parser = argparse.ArgumentParser(
+        description="LoRA Training for Inpainting using PEFT"
+    )
 
     # Required arguments
     parser.add_argument(
@@ -145,6 +151,33 @@ def parse_args():
     )
     parser.add_argument(
         "--seed", type=int, default=None, help="A seed for reproducible training."
+    )
+
+    # LoRA parameters
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=4,
+        help="Rank of LoRA layers.",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=32,
+        help="Alpha parameter for LoRA scaling.",
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability for LoRA layers.",
+    )
+    parser.add_argument(
+        "--lora_bias",
+        type=str,
+        default="none",
+        choices=["none", "all", "lora_only"],
+        help="Bias type for LoRA. 'none': no bias, 'all': all bias, 'lora_only': only LoRA bias",
     )
 
     # System parameters
@@ -393,30 +426,36 @@ def main():
         else:
             raise ValueError("xformers is not available")
 
-    # Setup LoRA - KEY PART
-    lora_attn_procs = {}
-    for name in unet.attn_processors.keys():
-        cross_attention_dim = (
-            None
-            if name.endswith("attn1.processor")
-            else unet.config.cross_attention_dim
-        )
+    # Setup LoRA using PEFT
+    # First, import the necessary function from diffusers
+    from diffusers.loaders import UNet2DConditionLoadersMixin
 
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = unet.config.block_out_channels[block_id]
+    # Create LoRA config
+    lora_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        lora_dropout=args.lora_dropout,
+        bias=args.lora_bias,
+    )
 
-        lora_attn_procs[name] = LoRAAttnProcessor(
-            hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
-        )
+    # Alternatively, we can use diffusers' built-in method for adding LoRA
+    # This is the recommended way in newer versions of diffusers
+    unet.add_adapter(lora_config)
 
-    unet.set_attn_processor(lora_attn_procs)
-    lora_layers = AttnProcsLayers(unet.attn_processors)
+    # Now only LoRA parameters are trainable
+    unet.train()
+
+    # Get trainable parameters
+    trainable_params = []
+    for name, param in unet.named_parameters():
+        if "lora" in name.lower():
+            param.requires_grad = True
+            trainable_params.append(param)
+        else:
+            param.requires_grad = False
+
+    print(f"Number of trainable parameters: {len(trainable_params)}")
 
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
@@ -433,7 +472,7 @@ def main():
         optimizer_class = torch.optim.AdamW
 
     optimizer = optimizer_class(
-        lora_layers.parameters(),
+        trainable_params,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -473,8 +512,8 @@ def main():
     )
 
     # Prepare with accelerator
-    lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        lora_layers, optimizer, train_dataloader, lr_scheduler
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
     )
 
     # Noise scheduler
@@ -496,6 +535,8 @@ def main():
     logger.info(f"  Total train batch size = {total_batch_size}")
     logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  LoRA rank = {args.lora_rank}")
+    logger.info(f"  LoRA alpha = {args.lora_alpha}")
 
     # Training loop
     global_step = 0
@@ -579,7 +620,7 @@ def main():
                 # Backward pass
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = lora_layers.parameters()
+                    params_to_clip = trainable_params
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
@@ -614,9 +655,24 @@ def main():
 
     # Save final model
     if accelerator.is_main_process:
+        # Save LoRA weights
         unet = unet.to(torch.float32)
+
+        # Save using PEFT's method
+        from peft import set_peft_model_state_dict
+
+        # Get the state dict
+        peft_state_dict = get_peft_model_state_dict(unet)
+
+        # Save LoRA weights
+        lora_save_path = os.path.join(args.output_dir, "lora_weights.safetensors")
+        torch.save(peft_state_dict, lora_save_path)
+
+        # Also save in the diffusers format for compatibility
         unet.save_attn_procs(args.output_dir)
+
         logger.info(f"Saved LoRA weights to {args.output_dir}")
+        logger.info(f"Saved PEFT LoRA weights to {lora_save_path}")
 
     accelerator.end_training()
 
