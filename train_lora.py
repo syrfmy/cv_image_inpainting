@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stable Diffusion LoRA Training - Corrected for UNet dimensions
+Stable Diffusion Fine-Tuning - Simple attention layer training
 """
 
 import argparse
@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    StableDiffusionPipeline,
     UNet2DConditionModel,
 )
 from PIL import Image
@@ -25,24 +24,24 @@ from tqdm import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 # ============================================================================
-# DATASET WITH PROPER RESIZING
+# DATASET
 # ============================================================================
 
 
 class StableDiffusionDataset(Dataset):
     """Dataset untuk fine-tuning Stable Diffusion"""
 
-    def __init__(self, data_path, tokenizer, image_size=512, is_test=False):
+    def __init__(self, data_path, tokenizer, image_size=64, is_test=False):
         """
         Args:
             data_path: Path to dataset directory
             tokenizer: CLIP tokenizer
-            image_size: Input image size (512 for SD 1.5)
+            image_size: Input image size
             is_test: If True, treat as test dataset where orig folder is optional
         """
         self.data_path = Path(data_path)
         self.tokenizer = tokenizer
-        self.image_size = image_size  # SD 1.5 expects 512x512 images
+        self.image_size = image_size
         self.is_test = is_test
 
         self.erased_dir = self.data_path / "erased"
@@ -147,7 +146,7 @@ class StableDiffusionDataset(Dataset):
         else:
             original = erased.copy()
 
-        # Resize to 512x512 for Stable Diffusion
+        # Resize
         original = original.resize((self.image_size, self.image_size), Image.LANCZOS)
         erased = erased.resize((self.image_size, self.image_size), Image.LANCZOS)
         mask = mask.resize((self.image_size, self.image_size), Image.LANCZOS)
@@ -187,13 +186,13 @@ class StableDiffusionDataset(Dataset):
 
 
 # ============================================================================
-# SETUP MODELS WITH CORRECT DIMENSIONS
+# SETUP MODELS - NO LoRA, JUST ATTENTION LAYER TRAINING
 # ============================================================================
 
 
-def setup_models_correct(args):
-    """Setup models with correct dimensions for Stable Diffusion"""
-    print("Setting up models with correct dimensions...")
+def setup_models_simple(args):
+    """Simple setup - train only attention projection layers"""
+    print("Setting up models for simple fine-tuning...")
 
     # Load tokenizer
     tokenizer = CLIPTokenizer.from_pretrained(args.model_name, subfolder="tokenizer")
@@ -214,58 +213,42 @@ def setup_models_correct(args):
     unet = UNet2DConditionModel.from_pretrained(args.model_name, subfolder="unet")
     unet.to(args.device)
 
-    # Freeze UNet initially
+    # Check UNet configuration
+    print(f"UNet sample size: {unet.config.sample_size}")
+    print(f"UNet in channels: {unet.config.in_channels}")
+
+    # Freeze all UNet parameters first
     unet.requires_grad_(False)
 
-    # Enable LoRA using diffusers built-in method
-    print(f"Setting up LoRA with rank={args.lora_rank}...")
-
-    from diffusers.models.attention_processor import LoRAAttnProcessor2_0
-
-    # Set attention processors to LoRA
-    lora_attn_procs = {}
-
-    for name in unet.attn_processors.keys():
-        cross_attention_dim = (
-            None
-            if name.endswith("attn1.processor")
-            else unet.config.cross_attention_dim
-        )
-
-        # Get hidden size based on block
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = unet.config.block_out_channels[block_id]
-        else:
-            hidden_size = None
-
-        if hidden_size is None:
-            continue
-
-        # Use LoRAAttnProcessor2_0 with correct parameters
-        lora_attn_procs[name] = LoRAAttnProcessor2_0(
-            hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=args.lora_rank,
-            network_alpha=args.lora_rank,
-        )
-
-    # Set the processors
-    unet.set_attn_processor(lora_attn_procs)
-
-    # Collect trainable parameters (only LoRA)
+    # Unfreeze only attention projection layers (like what LoRA would train)
     trainable_params = []
+
+    # List of attention layer patterns to train
+    attention_patterns = [
+        "to_q",  # Query projection
+        "to_k",  # Key projection
+        "to_v",  # Value projection
+        "to_out",  # Output projection
+        "proj_out",  # Another output projection variant
+        "proj_in",  # Input projection
+    ]
+
     for name, param in unet.named_parameters():
-        if "lora" in name:
+        # Check if this parameter is part of an attention layer
+        if any(pattern in name for pattern in attention_patterns):
             param.requires_grad = True
             trainable_params.append(param)
+            # print(f"Training: {name}")  # Uncomment to see which layers are trained
 
-    print(f"Trainable LoRA parameters: {sum(p.numel() for p in trainable_params):,}")
+    print(f"Training {len(trainable_params)} attention layers")
+    print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+
+    # Count total parameters for comparison
+    total_params = sum(p.numel() for p in unet.parameters())
+    print(f"Total UNet parameters: {total_params:,}")
+    print(
+        f"Training percentage: {sum(p.numel() for p in trainable_params) / total_params * 100:.2f}%"
+    )
 
     # Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
@@ -276,24 +259,24 @@ def setup_models_correct(args):
 
 
 # ============================================================================
-# TRAINING FUNCTION WITH CORRECT LATENT DIMENSIONS
+# TRAINING FUNCTION - SIMPLE NO LoRA
 # ============================================================================
 
 
-def train_correct(args):
-    """Training with correct latent dimensions"""
-    print("Starting training with correct dimensions...")
+def train_simple(args):
+    """Simple training without LoRA complexity"""
+    print("Starting simple fine-tuning (attention layers only)...")
 
     # Setup models
     tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params = (
-        setup_models_correct(args)
+        setup_models_simple(args)
     )
 
     # Training dataset
     train_dataset = StableDiffusionDataset(
         data_path=args.train_data,
         tokenizer=tokenizer,
-        image_size=512,  # Stable Diffusion expects 512x512
+        image_size=args.image_size,
         is_test=False,
     )
 
@@ -305,17 +288,44 @@ def train_correct(args):
     )
 
     print(f"Training on {len(train_dataset)} samples")
-    print(f"Image size: 512x512 (SD 1.5 standard)")
-    print(f"Latent size: 64x64 (512/8)")
+    print(f"Image size: {args.image_size}x{args.image_size}")
+    print(
+        f"Latent size: {args.image_size // 8}x{args.image_size // 8} (downsample factor 8)"
+    )
 
     # Optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
 
+    # Learning rate scheduler (optional)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs * len(train_dataloader),
+        eta_min=args.learning_rate * 0.1,
+    )
+
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
+    # Save configuration
+    config_file = os.path.join(args.checkpoint_dir, "config.txt")
+    with open(config_file, "w") as f:
+        f.write("Training Configuration:\n")
+        f.write("=" * 50 + "\n")
+        for key, value in vars(args).items():
+            f.write(f"{key}: {value}\n")
+        f.write(
+            f"\nTrainable parameters: {sum(p.numel() for p in trainable_params):,}\n"
+        )
+        f.write(f"Image size: {args.image_size}x{args.image_size}\n")
+        f.write(f"Dataset size: {len(train_dataset)} samples\n")
+
     # Training loop
     unet.train()
+    best_loss = float("inf")
+
+    # Track training history
+    train_loss_history = []
+    lr_history = []
 
     for epoch in range(args.epochs):
         epoch_loss = 0
@@ -326,12 +336,12 @@ def train_correct(args):
             original = batch["original"].to(args.device)
             input_ids = batch["input_ids"].to(args.device)
 
-            # Encode images to latent space (512 -> 64 latents)
+            # Encode images to latent space
             with torch.no_grad():
-                # Encode to latents: (B, 3, 512, 512) -> (B, 4, 64, 64)
+                # Encode to latents
                 latents_original = vae.encode(original).latent_dist.sample()
 
-                # Scale latents (following standard SD practice)
+                # Scale latents (standard SD practice)
                 latents_original = latents_original * 0.18215
 
                 # Get text embeddings
@@ -339,254 +349,6 @@ def train_correct(args):
                     encoder_hidden_states = text_encoder(input_ids)[0]
                 else:
                     encoder_hidden_states = None
-
-            # Sample noise
-            noise = torch.randn_like(latents_original)
-
-            # Sample timestep
-            timesteps = torch.randint(
-                0,
-                noise_scheduler.config.num_train_timesteps,
-                (latents_original.shape[0],),
-                device=args.device,
-            ).long()
-
-            # Add noise to latents
-            noisy_latents = noise_scheduler.add_noise(
-                latents_original, noise, timesteps
-            )
-
-            # Predict noise - LATENTS SHOULD BE (B, 4, 64, 64)
-            noise_pred = unet(
-                noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states
-            ).sample
-
-            # Calculate loss
-            loss = F.mse_loss(noise_pred, noise)
-
-            # Backprop
-            optimizer.zero_grad()
-            loss.backward()
-
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-
-            optimizer.step()
-
-            # Update metrics
-            epoch_loss += loss.item()
-
-            # Print debug info occasionally
-            if batch_idx == 0:
-                print(f"\nDebug info:")
-                print(
-                    f"  Original shape: {original.shape}"
-                )  # Should be (B, 3, 512, 512)
-                print(
-                    f"  Latents shape: {latents_original.shape}"
-                )  # Should be (B, 4, 64, 64)
-                print(
-                    f"  Noise pred shape: {noise_pred.shape}"
-                )  # Should be (B, 4, 64, 64)
-                print(
-                    f"  Encoder hidden states: {encoder_hidden_states.shape if encoder_hidden_states is not None else 'None'}"
-                )
-
-            progress_bar.set_postfix({"loss": loss.item()})
-
-        avg_loss = epoch_loss / len(train_dataloader)
-        print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}")
-
-        # Save checkpoint
-        if (epoch + 1) % args.save_every_n_epochs == 0:
-            checkpoint_path = os.path.join(
-                args.checkpoint_dir, f"lora_epoch_{epoch + 1}.safetensors"
-            )
-
-            # Save LoRA weights using diffusers method
-            unet.save_attn_procs(
-                args.checkpoint_dir, weight_name=f"lora_epoch_{epoch + 1}.safetensors"
-            )
-            print(f"Checkpoint saved to {checkpoint_path}")
-
-            # Also save optimizer state
-            optimizer_path = os.path.join(
-                args.checkpoint_dir, f"optimizer_epoch_{epoch + 1}.pt"
-            )
-            torch.save(optimizer.state_dict(), optimizer_path)
-
-    print("Training completed!")
-
-    # Save final LoRA weights
-    final_path = os.path.join(args.checkpoint_dir, "lora_final.safetensors")
-    unet.save_attn_procs(args.checkpoint_dir, weight_name="lora_final.safetensors")
-    print(f"Final LoRA weights saved to {final_path}")
-
-    return unet
-
-
-# ============================================================================
-# ALTERNATIVE: FINE-TUNE ON 64x64 DIRECTLY (CUSTOM DIMENSIONS)
-# ============================================================================
-
-
-def setup_models_64x64(args):
-    """Setup for 64x64 images - custom UNet configuration"""
-    print("Setting up for 64x64 images...")
-
-    # Load tokenizer
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_name, subfolder="tokenizer")
-
-    # Load text encoder
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.model_name, subfolder="text_encoder"
-    )
-    text_encoder.to(args.device)
-    text_encoder.requires_grad_(False)
-
-    # Load VAE
-    vae = AutoencoderKL.from_pretrained(args.model_name, subfolder="vae")
-    vae.to(args.device)
-    vae.requires_grad_(False)
-
-    # Load UNet - but we need to handle 64x64 images
-    # For 64x64 images, latents will be 8x8 (64/8)
-    unet = UNet2DConditionModel.from_pretrained(args.model_name, subfolder="unet")
-
-    # Check UNet configuration
-    print(f"UNet config:")
-    print(f"  Sample size: {unet.config.sample_size}")  # Should be 64 for SD 1.5
-    print(f"  In channels: {unet.config.in_channels}")  # Should be 4
-    print(f"  Out channels: {unet.config.out_channels}")  # Should be 4
-
-    # For 64x64 images, we need to handle scaling
-    # VAE downsampling factor is 8, so 64x64 -> 8x8 latents
-    unet.to(args.device)
-
-    # Enable LoRA
-    print(f"Setting up LoRA with rank={args.lora_rank}...")
-
-    from diffusers.models.attention_processor import LoRAAttnProcessor2_0
-
-    # Set attention processors to LoRA
-    lora_attn_procs = {}
-
-    for name in unet.attn_processors.keys():
-        cross_attention_dim = (
-            None
-            if name.endswith("attn1.processor")
-            else unet.config.cross_attention_dim
-        )
-
-        # Get hidden size based on block
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = unet.config.block_out_channels[block_id]
-        else:
-            hidden_size = None
-
-        if hidden_size is None:
-            continue
-
-        # Use LoRAAttnProcessor2_0 with correct parameters
-        lora_attn_procs[name] = LoRAAttnProcessor2_0(
-            hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=args.lora_rank,
-            network_alpha=args.lora_rank,  # Can be same as rank
-        )
-
-    # Set the processors
-    unet.set_attn_processor(lora_attn_procs)
-
-    # Freeze UNet, only train LoRA
-    unet.requires_grad_(False)
-
-    # Collect trainable parameters (only LoRA)
-    trainable_params = []
-    for name, param in unet.named_parameters():
-        if "lora" in name:
-            param.requires_grad = True
-            trainable_params.append(param)
-
-    print(f"Trainable LoRA parameters: {sum(p.numel() for p in trainable_params):,}")
-
-    # Noise scheduler
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        args.model_name, subfolder="scheduler"
-    )
-
-    return tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params
-
-
-def train_64x64(args):
-    """Train on 64x64 images directly"""
-    print("Training on 64x64 images...")
-
-    # Setup models
-    tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params = (
-        setup_models_64x64(args)
-    )
-
-    # Training dataset - use 64x64 images
-    train_dataset = StableDiffusionDataset(
-        data_path=args.train_data,
-        tokenizer=tokenizer,
-        image_size=64,  # Use 64x64 images
-        is_test=False,
-    )
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-    )
-
-    print(f"Training on {len(train_dataset)} 64x64 samples")
-    print(f"Latent size will be: 8x8 (64/8)")
-
-    # Optimizer
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
-
-    # Create checkpoint directory
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-
-    # Training loop
-    unet.train()
-
-    for epoch in range(args.epochs):
-        epoch_loss = 0
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
-
-        for batch_idx, batch in enumerate(progress_bar):
-            # Move to device
-            original = batch["original"].to(args.device)
-            input_ids = batch["input_ids"].to(args.device)
-
-            # Encode 64x64 images to latent space (64 -> 8 latents)
-            with torch.no_grad():
-                # For 64x64 images, VAE will output 8x8 latents
-                latents_original = vae.encode(original).latent_dist.sample()
-                latents_original = latents_original * 0.18215
-
-                # Get text embeddings
-                if args.use_text_conditioning:
-                    encoder_hidden_states = text_encoder(input_ids)[0]
-                else:
-                    encoder_hidden_states = None
-
-            # Debug shapes
-            if batch_idx == 0 and epoch == 0:
-                print(f"\nDebug shapes for 64x64 training:")
-                print(f"  Input images: {original.shape}")  # (B, 3, 64, 64)
-                print(f"  Latents: {latents_original.shape}")  # Should be (B, 4, 8, 8)
-                print(f"  UNet sample size config: {unet.config.sample_size}")
 
             # Sample noise
             noise = torch.randn_like(latents_original)
@@ -615,36 +377,141 @@ def train_64x64(args):
             # Backprop
             optimizer.zero_grad()
             loss.backward()
+
+            # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+
             optimizer.step()
+            scheduler.step()
 
             # Update metrics
             epoch_loss += loss.item()
+            current_lr = scheduler.get_last_lr()[0]
+            lr_history.append(current_lr)
 
-            progress_bar.set_postfix({"loss": loss.item()})
+            # Print debug info for first batch of first epoch
+            if batch_idx == 0 and epoch == 0:
+                print(f"\nDebug info (first batch):")
+                print(f"  Original shape: {original.shape}")
+                print(f"  Latents shape: {latents_original.shape}")
+                print(f"  Noise pred shape: {noise_pred.shape}")
+                print(f"  Loss: {loss.item():.4f}")
+
+            progress_bar.set_postfix({"loss": loss.item(), "lr": f"{current_lr:.2e}"})
 
         avg_loss = epoch_loss / len(train_dataloader)
-        print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}")
+        train_loss_history.append(avg_loss)
+        print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}, LR: {current_lr:.2e}")
 
         # Save checkpoint
         if (epoch + 1) % args.save_every_n_epochs == 0:
             checkpoint_path = os.path.join(
-                args.checkpoint_dir, f"lora_64x64_epoch_{epoch + 1}.safetensors"
+                args.checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt"
             )
-            unet.save_attn_procs(
-                args.checkpoint_dir,
-                weight_name=f"lora_64x64_epoch_{epoch + 1}.safetensors",
+
+            # Save model state
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "unet_state_dict": unet.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "loss": avg_loss,
+                    "args": vars(args),
+                    "train_loss_history": train_loss_history,
+                    "lr_history": lr_history,
+                },
+                checkpoint_path,
             )
             print(f"Checkpoint saved to {checkpoint_path}")
 
+            # Save best model
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_path = os.path.join(args.checkpoint_dir, "best_model.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "unet_state_dict": unet.state_dict(),
+                        "loss": avg_loss,
+                        "args": vars(args),
+                    },
+                    best_path,
+                )
+                print(f"Best model saved (loss: {avg_loss:.4f})")
+
     print("Training completed!")
 
-    # Save final
-    final_path = os.path.join(args.checkpoint_dir, "lora_64x64_final.safetensors")
-    unet.save_attn_procs(
-        args.checkpoint_dir, weight_name="lora_64x64_final.safetensors"
+    # Save final model
+    final_path = os.path.join(args.checkpoint_dir, "final_model.pt")
+    torch.save(
+        {
+            "epoch": args.epochs,
+            "unet_state_dict": unet.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": avg_loss,
+            "args": vars(args),
+            "train_loss_history": train_loss_history,
+            "lr_history": lr_history,
+        },
+        final_path,
     )
-    print(f"Final LoRA weights saved to {final_path}")
+    print(f"Final model saved to {final_path}")
+
+    # Plot training history
+    if args.plot_training_history:
+        plt.figure(figsize=(12, 4))
+
+        plt.subplot(1, 2, 1)
+        plt.plot(train_loss_history)
+        plt.title("Training Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.grid(True)
+
+        plt.subplot(1, 2, 2)
+        plt.plot(lr_history[: len(lr_history) // 10])  # Plot first 10% of LR history
+        plt.title("Learning Rate Schedule")
+        plt.xlabel("Step")
+        plt.ylabel("Learning Rate")
+        plt.grid(True)
+
+        plt.tight_layout()
+        plot_path = os.path.join(args.checkpoint_dir, "training_history.png")
+        plt.savefig(plot_path, dpi=150)
+        print(f"Training history plot saved to {plot_path}")
+
+        if args.show_plots:
+            plt.show()
+
+    return unet
+
+
+# ============================================================================
+# EVALUATION FUNCTION
+# ============================================================================
+
+
+def evaluate_model(model_path, args):
+    """Evaluate trained model"""
+    print(f"Evaluating model from {model_path}")
+
+    # Load tokenizer
+    tokenizer = CLIPTokenizer.from_pretrained(args.model_name, subfolder="tokenizer")
+
+    # Load UNet
+    unet = UNet2DConditionModel.from_pretrained(args.model_name, subfolder="unet")
+    unet.to(args.device)
+
+    # Load trained weights
+    checkpoint = torch.load(model_path, map_location=args.device)
+    unet.load_state_dict(checkpoint["unet_state_dict"])
+
+    print(f"Model loaded from epoch {checkpoint.get('epoch', 'unknown')}")
+    print(f"Training loss: {checkpoint.get('loss', 'unknown'):.4f}")
+
+    # You can add evaluation logic here
+    # For example, generate some test images
 
     return unet
 
@@ -655,11 +522,17 @@ def train_64x64(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Stable Diffusion with LoRA")
+    parser = argparse.ArgumentParser(description="Fine-tune Stable Diffusion (No LoRA)")
 
     # Dataset paths
     parser.add_argument(
         "--train_data", type=str, required=True, help="Path to training dataset"
+    )
+    parser.add_argument(
+        "--eval_data",
+        type=str,
+        default=None,
+        help="Path to evaluation dataset (optional)",
     )
 
     # Model settings
@@ -670,17 +543,13 @@ def main():
         help="Base model name",
     )
     parser.add_argument(
-        "--lora_rank", type=int, default=4, help="Rank for LoRA (4-16 typically)"
-    )
-    parser.add_argument(
         "--use_text_conditioning", action="store_true", help="Use text conditioning"
     )
     parser.add_argument(
         "--image_size",
         type=int,
-        choices=[64, 512],
         default=64,
-        help="Image size for training (64 or 512)",
+        help="Image size for training (default: 64)",
     )
 
     # Training hyperparameters
@@ -702,6 +571,22 @@ def main():
         type=int,
         default=5,
         help="Save checkpoint every N epochs",
+    )
+
+    # Visualization
+    parser.add_argument(
+        "--plot_training_history", action="store_true", help="Plot training history"
+    )
+    parser.add_argument(
+        "--show_plots", action="store_true", help="Show plots during training"
+    )
+
+    # Evaluation mode
+    parser.add_argument(
+        "--evaluate", action="store_true", help="Evaluate instead of train"
+    )
+    parser.add_argument(
+        "--model_path", type=str, default=None, help="Path to model for evaluation"
     )
 
     # System settings
@@ -729,13 +614,14 @@ def main():
     for key, value in vars(args).items():
         print(f"  {key}: {value}")
 
-    # Choose training method based on image size
-    if args.image_size == 512:
-        print("\nTraining on 512x512 images (standard SD 1.5)...")
-        train_correct(args)
-    else:  # 64x64
-        print("\nTraining on 64x64 images...")
-        train_64x64(args)
+    # Run training or evaluation
+    if args.evaluate:
+        if not args.model_path:
+            print("Error: --model_path required for evaluation")
+            return
+        evaluate_model(args.model_path, args)
+    else:
+        train_simple(args)
 
 
 if __name__ == "__main__":
