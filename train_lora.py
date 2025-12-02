@@ -250,17 +250,18 @@ def setup_models_correct(args):
         if hidden_size is None:
             continue
 
-        # Choose processor class
+        # Choose processor - FIXED
         if hasattr(F, "scaled_dot_product_attention"):
-            attn_processor_class = LoRAAttnProcessor2_0
+            lora_attn_procs[name] = LoRAAttnProcessor2_0(
+                cross_attention_dim=cross_attention_dim,
+                rank=args.lora_rank,
+            )
         else:
-            attn_processor_class = LoRAAttnProcessor
-
-        lora_attn_procs[name] = attn_processor_class(
-            hidden_size=hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=args.lora_rank,
-        )
+            lora_attn_procs[name] = LoRAAttnProcessor(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                rank=args.lora_rank,
+            )
 
     # Set the processors
     unet.set_attn_processor(lora_attn_procs)
@@ -502,17 +503,18 @@ def setup_models_64x64(args):
         if hidden_size is None:
             continue
 
-        # Choose processor
+        # Choose processor - FIXED: LoRAAttnProcessor2_0 doesn't take hidden_size parameter
         if hasattr(F, "scaled_dot_product_attention"):
-            attn_processor_class = LoRAAttnProcessor2_0
+            lora_attn_procs[name] = LoRAAttnProcessor2_0(
+                cross_attention_dim=cross_attention_dim,
+                rank=args.lora_rank,
+            )
         else:
-            attn_processor_class = LoRAAttnProcessor
-
-        lora_attn_procs[name] = attn_processor_class(
-            hidden_size=hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=args.lora_rank,
-        )
+            lora_attn_procs[name] = LoRAAttnProcessor(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                rank=args.lora_rank,
+            )
 
     unet.set_attn_processor(lora_attn_procs)
 
