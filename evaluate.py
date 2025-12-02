@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Evaluation script for LoRA trained inpainting model.
-Uses masks from test dataset instead of generating them.
+Evaluation script for LoRA trained inpainting model - FIXED VERSION
+Handles .safetensors files and local LoRA weights
 """
 
 import argparse
+import json
 import os
 import random
 from pathlib import Path
@@ -12,14 +13,18 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from diffusers import StableDiffusionInpaintPipeline
+from diffusers import (
+    AutoencoderKL,
+    StableDiffusionInpaintPipeline,
+    UNet2DConditionModel,
+)
 from PIL import Image
 from tqdm import tqdm
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate LoRA model using dataset masks"
+        description="Evaluate LoRA model using dataset masks - FIXED VERSION"
     )
 
     # Required arguments
@@ -27,7 +32,7 @@ def parse_args():
         "--lora_path",
         type=str,
         required=True,
-        help="Path to trained LoRA weights directory",
+        help="Path to trained LoRA weights directory (contains pytorch_lora_weights.safetensors or .bin)",
     )
     parser.add_argument(
         "--test_data_dir",
@@ -92,6 +97,12 @@ def parse_args():
         type=str,
         default="orig",
         help="Name of folder containing original images (optional)",
+    )
+    parser.add_argument(
+        "--lora_file",
+        type=str,
+        default="pytorch_lora_weights.safetensors",
+        help="Name of LoRA weights file",
     )
 
     return parser.parse_args()
@@ -363,6 +374,78 @@ def create_inpainting_visualization(
     return fig
 
 
+def load_pipeline_with_lora(
+    model_name, lora_path, lora_file="pytorch_lora_weights.safetensors"
+):
+    """Load pipeline with LoRA weights - FIXED VERSION"""
+    print(f"Loading base model: {model_name}")
+    print(f"Loading LoRA from: {lora_path}")
+
+    # Load base pipeline
+    pipe = StableDiffusionInpaintPipeline.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        safety_checker=None,
+    )
+
+    # Check what LoRA files are available
+    lora_dir = Path(lora_path)
+
+    # Look for LoRA files
+    lora_files = []
+    possible_lora_files = [
+        lora_file,  # User specified
+        "pytorch_lora_weights.safetensors",
+        "pytorch_lora_weights.bin",
+        "lora_weights.safetensors",
+        "lora_weights.bin",
+        "lora.safetensors",
+        "lora.bin",
+    ]
+
+    for lora_file_name in possible_lora_files:
+        lora_file_path = lora_dir / lora_file_name
+        if lora_file_path.exists():
+            lora_files.append(lora_file_path)
+            print(f"Found LoRA file: {lora_file_path}")
+
+    if not lora_files:
+        # Try to find any safetensors or bin files
+        for ext in ["*.safetensors", "*.bin"]:
+            found = list(lora_dir.glob(ext))
+            if found:
+                lora_files.extend(found)
+                print(f"Found LoRA files: {found}")
+
+    if not lora_files:
+        # If no specific files, check if the directory contains the weights
+        # (older diffusers versions save weights in the directory directly)
+        print(
+            f"No specific LoRA files found. Checking if directory contains LoRA weights..."
+        )
+
+        # Try to load directly from directory
+        try:
+            pipe.unet.load_attn_procs(lora_path, use_safetensors=True)
+            print("Successfully loaded LoRA weights from directory")
+            return pipe
+        except Exception as e:
+            print(f"Could not load LoRA weights: {e}")
+            raise
+
+    # Load the first found LoRA file
+    lora_file_to_load = lora_files[0]
+    print(f"Loading LoRA from: {lora_file_to_load}")
+
+    # Load LoRA weights
+    if str(lora_file_to_load).endswith(".safetensors"):
+        pipe.unet.load_attn_procs(lora_path, weight_name=lora_file_to_load.name)
+    else:
+        pipe.unet.load_attn_procs(lora_path)
+
+    return pipe
+
+
 def main():
     args = parse_args()
 
@@ -374,22 +457,13 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load pipeline with LoRA
-    print(f"Loading model from {args.model_name}")
-    print(f"Loading LoRA weights from {args.lora_path}")
-
-    pipe = StableDiffusionInpaintPipeline.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        safety_checker=None,
-    )
-
-    # Load LoRA weights
-    pipe.unet.load_attn_procs(args.lora_path)
+    # Load pipeline with LoRA - USING FIXED FUNCTION
+    pipe = load_pipeline_with_lora(args.model_name, args.lora_path, args.lora_file)
 
     # Enable memory efficient attention if available
     try:
         pipe.enable_xformers_memory_efficient_attention()
+        print("Enabled xformers memory efficient attention")
     except:
         print("XFormers not available, using default attention")
 
@@ -505,6 +579,9 @@ def main():
 
         except Exception as e:
             print(f"\nError processing sample {i} ({sample['base_name']}): {str(e)}")
+            import traceback
+
+            traceback.print_exc()
             continue
 
     # Print summary statistics
@@ -548,8 +625,6 @@ def main():
                     )
 
         # Save detailed results
-        import json
-
         results_file = os.path.join(args.output_dir, "evaluation_results.json")
         with open(results_file, "w") as f:
             json.dump(
