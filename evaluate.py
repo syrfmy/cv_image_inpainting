@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Evaluation script for LoRA trained inpainting model - FIXED VERSION
-Handles .safetensors files and local LoRA weights
+With proper mask inversion (black = damage → white = inpaint)
 """
 
 import argparse
@@ -13,18 +13,14 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from diffusers import (
-    AutoencoderKL,
-    StableDiffusionInpaintPipeline,
-    UNet2DConditionModel,
-)
-from PIL import Image
+from diffusers import StableDiffusionInpaintPipeline
+from PIL import Image, ImageOps
 from tqdm import tqdm
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate LoRA model using dataset masks - FIXED VERSION"
+        description="Evaluate LoRA model using dataset masks - FIXED with mask inversion"
     )
 
     # Required arguments
@@ -32,13 +28,13 @@ def parse_args():
         "--lora_path",
         type=str,
         required=True,
-        help="Path to trained LoRA weights directory (contains pytorch_lora_weights.safetensors or .bin)",
+        help="Path to trained LoRA weights directory",
     )
     parser.add_argument(
         "--test_data_dir",
         type=str,
         required=True,
-        help="Path to test dataset directory (must contain erased/ and masks/ folders)",
+        help="Path to test dataset directory (must contain orig/ and masks/ folders)",
     )
 
     # Optional arguments
@@ -76,15 +72,16 @@ def parse_args():
         "--guidance_scale", type=float, default=7.5, help="Guidance scale"
     )
     parser.add_argument(
-        "--compare_with_orig",
+        "--invert_masks",
         action="store_true",
-        help="Compare with original images if orig/ folder exists",
+        default=True,
+        help="Invert masks (black=damage → white=inpaint). Default: True",
     )
     parser.add_argument(
-        "--erased_folder",
+        "--orig_folder",
         type=str,
-        default="erased",
-        help="Name of folder containing erased images",
+        default="orig",
+        help="Name of folder containing original images",
     )
     parser.add_argument(
         "--mask_folder",
@@ -93,10 +90,10 @@ def parse_args():
         help="Name of folder containing mask images",
     )
     parser.add_argument(
-        "--orig_folder",
+        "--erased_folder",
         type=str,
-        default="orig",
-        help="Name of folder containing original images (optional)",
+        default="erased",
+        help="Name of folder containing erased images (for comparison only)",
     )
     parser.add_argument(
         "--lora_file",
@@ -110,29 +107,38 @@ def parse_args():
 
 def load_test_samples_with_masks(
     test_dir,
-    erased_folder="erased",
-    mask_folder="masks",
     orig_folder="orig",
+    mask_folder="masks",
+    erased_folder="erased",
     num_samples=0,
-    compare_orig=False,
+    invert_masks=True,
 ):
-    """Load test samples with their corresponding masks"""
+    """Load test samples with their corresponding masks - FIXED VERSION
+
+    Args:
+        test_dir: Directory containing test data
+        orig_folder: Folder with original images (input for inpainting)
+        mask_folder: Folder with masks (black = damage, white = intact)
+        erased_folder: Folder with erased images (for comparison)
+        num_samples: Number of samples to load (0 for all)
+        invert_masks: Whether to invert masks (black=damage → white=inpaint)
+    """
     test_dir = Path(test_dir)
 
-    # Check for erased folder
-    erased_dir = test_dir / erased_folder
-    if not erased_dir.exists():
+    # Check for ORIGINAL folder (this is our input for inpainting)
+    orig_dir = test_dir / orig_folder
+    if not orig_dir.exists():
         # Try alternative names
-        for folder_name in ["erased", "erased_test", "test", "val"]:
+        for folder_name in ["orig", "orig_test", "original", "originals"]:
             potential_dir = test_dir / folder_name
             if potential_dir.exists():
-                erased_dir = potential_dir
+                orig_dir = potential_dir
                 break
 
-        if not erased_dir.exists():
-            raise ValueError(f"No erased folder found in {test_dir}")
+        if not orig_dir.exists():
+            raise ValueError(f"No original image folder found in {test_dir}")
 
-    print(f"Using erased folder: {erased_dir}")
+    print(f"Using original folder: {orig_dir}")
 
     # Check for mask folder
     mask_dir = test_dir / mask_folder
@@ -148,51 +154,35 @@ def load_test_samples_with_masks(
             raise ValueError(f"No mask folder found in {test_dir}")
 
     print(f"Using mask folder: {mask_dir}")
+    if invert_masks:
+        print("Note: Masks will be inverted (black=damage → white=inpaint)")
 
-    # Check for orig folder if needed
-    orig_dir = None
-    if compare_orig:
-        orig_dir = test_dir / orig_folder
-        if not orig_dir.exists():
-            # Try alternative names
-            for folder_name in ["orig", "orig_test", "original", "originals"]:
-                potential_dir = test_dir / folder_name
-                if potential_dir.exists():
-                    orig_dir = potential_dir
-                    break
+    # Check for erased folder (for comparison only)
+    erased_dir = test_dir / erased_folder
+    has_erased = erased_dir.exists()
+    if has_erased:
+        print(f"Found erased folder for comparison: {erased_dir}")
 
-            if not orig_dir.exists():
-                print(f"Warning: No original folder found for comparison")
-                orig_dir = None
+    # Load original images (these are our inputs for inpainting)
+    orig_files = sorted(list(orig_dir.glob("*.png")))
 
-    if orig_dir and orig_dir.exists():
-        print(f"Using original folder: {orig_dir}")
-
-    # Load erased images
-    erased_files = sorted(list(erased_dir.glob("*_erased.png")))
-
-    if not erased_files:
-        # Try without _erased suffix
-        erased_files = sorted(list(erased_dir.glob("*.png")))
-
-    if num_samples > 0 and num_samples < len(erased_files):
-        # Randomly sample if requested
+    if num_samples > 0 and num_samples < len(orig_files):
         random.seed(42)
-        erased_files = random.sample(erased_files, num_samples)
+        orig_files = random.sample(orig_files, num_samples)
 
     samples = []
 
-    for erased_path in tqdm(erased_files, desc="Loading test samples with masks"):
+    for orig_path in tqdm(orig_files, desc="Loading test samples"):
         # Extract base name
-        filename = erased_path.stem  # e.g., "6__val_m00_erased"
-        base_name = filename.replace("_erased", "")  # e.g., "6__val_m00"
+        filename = orig_path.stem  # e.g., "6__val_m00"
+        base_name = filename  # Original files don't have _erased suffix
 
         # Get emoji ID for prompt
         emoji_id = base_name.split("__")[0]
         prompt = f"emoji {emoji_id}"
 
-        # Load erased image
-        erased_image = Image.open(erased_path).convert("RGB")
+        # Load ORIGINAL image (this is the input for inpainting)
+        original_image = Image.open(orig_path).convert("RGB")
 
         # Load corresponding mask
         mask_filename = f"{base_name}_mask.png"
@@ -211,41 +201,48 @@ def load_test_samples_with_masks(
 
         mask_image = Image.open(mask_path).convert("L")
 
-        # Load original image if available and requested
-        orig_image = None
-        if orig_dir and orig_dir.exists():
-            orig_filename = f"{base_name}.png"
-            orig_path = orig_dir / orig_filename
+        # INVERT THE MASK if needed
+        # Your masks: black = damage (should inpaint), white = intact (should keep)
+        # SD expects: white = inpaint, black = keep
+        if invert_masks:
+            mask_image = ImageOps.invert(mask_image)
+            print(f"  Inverted mask for {base_name}")
 
-            if orig_path.exists():
-                orig_image = Image.open(orig_path).convert("RGB")
-            else:
-                # Try with different naming
-                alt_orig_paths = [
-                    orig_dir / f"{base_name}_orig.png",
-                    orig_dir / f"{base_name}_original.png",
-                    orig_dir / filename.replace("_erased", ".png"),
-                ]
-
-                for alt_path in alt_orig_paths:
-                    if alt_path.exists():
-                        orig_image = Image.open(alt_path).convert("RGB")
-                        break
+        # Load erased image for comparison only (not for input)
+        erased_image = None
+        if has_erased:
+            erased_filename = f"{base_name}_erased.png"
+            erased_path = erased_dir / erased_filename
+            if erased_path.exists():
+                erased_image = Image.open(erased_path).convert("RGB")
 
         samples.append(
             {
                 "prompt": prompt,
-                "erased_image": erased_image,
-                "mask_image": mask_image,
-                "orig_image": orig_image,
+                "original_image": original_image,  # Full original image (INPUT)
+                "mask_image": mask_image,  # Inverted if needed (white = inpaint)
+                "erased_image": erased_image,  # For visualization comparison only
+                "ground_truth": original_image,  # For metrics calculation
                 "base_name": base_name,
                 "emoji_id": emoji_id,
-                "erased_filename": erased_path.name,
+                "orig_filename": orig_path.name,
                 "mask_filename": mask_path.name,
             }
         )
 
     print(f"Loaded {len(samples)} test samples with masks")
+
+    # Show sample mask statistics
+    if samples:
+        sample_mask = np.array(samples[0]["mask_image"])
+        black_pixels = np.sum(sample_mask < 128)
+        white_pixels = np.sum(sample_mask >= 128)
+        total_pixels = sample_mask.size
+        print(
+            f"Sample mask: {white_pixels / total_pixels * 100:.1f}% white (inpaint), "
+            f"{black_pixels / total_pixels * 100:.1f}% black (keep)"
+        )
+
     return samples
 
 
@@ -260,10 +257,11 @@ def calculate_inpainting_metrics(original, generated, mask):
     mask_np = np.array(mask).astype(np.float32) / 255.0
 
     # Get binary mask (masked regions where we should inpaint)
+    # After inversion: white (>0.5) = inpaint, black (<0.5) = keep
     mask_binary = mask_np > 0.5
 
     if not mask_binary.any():
-        print("Warning: Mask has no positive regions")
+        print("Warning: Mask has no positive regions (nothing to inpaint)")
         return {}
 
     # Get unmasked regions (where mask == 0, should be preserved)
@@ -314,6 +312,8 @@ def calculate_inpainting_metrics(original, generated, mask):
         "mse_overall": float(mse_overall),
         "psnr_overall": float(psnr_overall),
         "mask_area_ratio": float(mask_area_ratio),
+        "pixels_to_inpaint": int(np.sum(mask_binary)),
+        "pixels_to_preserve": int(np.sum(unmasked_binary)),
     }
 
 
@@ -322,24 +322,28 @@ def create_inpainting_visualization(
     mask_img,
     generated_img,
     original_img=None,
+    erased_img=None,
     metrics=None,
-    show_mask_overlay=True,
 ):
     """Create visualization for inpainting results"""
 
-    num_plots = 3 + (1 if original_img is not None else 0)
+    num_plots = (
+        3
+        + (1 if original_img is not None else 0)
+        + (1 if erased_img is not None else 0)
+    )
     fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5))
 
     idx = 0
 
-    # 1. Input image (erased)
+    # 1. Original Image (Input to inpainting)
     axes[idx].imshow(input_img)
-    axes[idx].set_title("Input (Erased Image)")
+    axes[idx].set_title("Input (Original Image)")
     axes[idx].axis("off")
     idx += 1
 
-    # 2. Mask
-    axes[idx].imshow(mask_img, cmap="gray")
+    # 2. Mask (white = inpaint, black = keep)
+    axes[idx].imshow(mask_img, cmap="gray", vmin=0, vmax=255)
     axes[idx].set_title("Mask (White = Inpaint)")
     axes[idx].axis("off")
     idx += 1
@@ -350,7 +354,14 @@ def create_inpainting_visualization(
     axes[idx].axis("off")
     idx += 1
 
-    # 4. Original (if available)
+    # 4. Erased image (for comparison)
+    if erased_img is not None:
+        axes[idx].imshow(erased_img)
+        axes[idx].set_title("Erased Image")
+        axes[idx].axis("off")
+        idx += 1
+
+    # 5. Ground truth (original again, for metrics)
     if original_img is not None:
         axes[idx].imshow(original_img)
         axes[idx].set_title("Ground Truth")
@@ -361,9 +372,9 @@ def create_inpainting_visualization(
     if metrics:
         metrics_text = []
         if "psnr_masked" in metrics:
-            metrics_text.append(f"PSNR (masked): {metrics['psnr_masked']:.2f} dB")
+            metrics_text.append(f"PSNR (inpainted): {metrics['psnr_masked']:.2f} dB")
         if "psnr_unmasked" in metrics:
-            metrics_text.append(f"PSNR (unmasked): {metrics['psnr_unmasked']:.2f} dB")
+            metrics_text.append(f"PSNR (preserved): {metrics['psnr_unmasked']:.2f} dB")
         if "mask_area_ratio" in metrics:
             metrics_text.append(f"Mask area: {metrics['mask_area_ratio'] * 100:.1f}%")
 
@@ -377,7 +388,7 @@ def create_inpainting_visualization(
 def load_pipeline_with_lora(
     model_name, lora_path, lora_file="pytorch_lora_weights.safetensors"
 ):
-    """Load pipeline with LoRA weights - FIXED VERSION"""
+    """Load pipeline with LoRA weights"""
     print(f"Loading base model: {model_name}")
     print(f"Loading LoRA from: {lora_path}")
 
@@ -392,56 +403,40 @@ def load_pipeline_with_lora(
     lora_dir = Path(lora_path)
 
     # Look for LoRA files
-    lora_files = []
     possible_lora_files = [
-        lora_file,  # User specified
+        lora_file,
         "pytorch_lora_weights.safetensors",
         "pytorch_lora_weights.bin",
         "lora_weights.safetensors",
         "lora_weights.bin",
-        "lora.safetensors",
-        "lora.bin",
     ]
 
+    lora_file_to_load = None
     for lora_file_name in possible_lora_files:
         lora_file_path = lora_dir / lora_file_name
         if lora_file_path.exists():
-            lora_files.append(lora_file_path)
-            print(f"Found LoRA file: {lora_file_path}")
+            lora_file_to_load = lora_file_path
+            print(f"Found LoRA file: {lora_file_to_load}")
+            break
 
-    if not lora_files:
+    if lora_file_to_load is None:
         # Try to find any safetensors or bin files
         for ext in ["*.safetensors", "*.bin"]:
             found = list(lora_dir.glob(ext))
             if found:
-                lora_files.extend(found)
-                print(f"Found LoRA files: {found}")
+                lora_file_to_load = found[0]
+                print(f"Found LoRA file: {lora_file_to_load}")
+                break
 
-    if not lora_files:
-        # If no specific files, check if the directory contains the weights
-        # (older diffusers versions save weights in the directory directly)
-        print(
-            f"No specific LoRA files found. Checking if directory contains LoRA weights..."
-        )
-
-        # Try to load directly from directory
-        try:
-            pipe.unet.load_attn_procs(lora_path, use_safetensors=True)
-            print("Successfully loaded LoRA weights from directory")
-            return pipe
-        except Exception as e:
-            print(f"Could not load LoRA weights: {e}")
-            raise
-
-    # Load the first found LoRA file
-    lora_file_to_load = lora_files[0]
-    print(f"Loading LoRA from: {lora_file_to_load}")
+    if lora_file_to_load is None:
+        print("Warning: No LoRA file found. Trying to load from directory...")
+        lora_file_to_load = lora_path
 
     # Load LoRA weights
     if str(lora_file_to_load).endswith(".safetensors"):
-        pipe.unet.load_attn_procs(lora_path, weight_name=lora_file_to_load.name)
+        pipe.unet.load_attn_procs(str(lora_file_to_load), use_safetensors=True)
     else:
-        pipe.unet.load_attn_procs(lora_path)
+        pipe.unet.load_attn_procs(str(lora_file_to_load))
 
     return pipe
 
@@ -457,7 +452,7 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load pipeline with LoRA - USING FIXED FUNCTION
+    # Load pipeline with LoRA
     pipe = load_pipeline_with_lora(args.model_name, args.lora_path, args.lora_file)
 
     # Enable memory efficient attention if available
@@ -474,14 +469,14 @@ def main():
     else:
         print("Using CPU (slow)")
 
-    # Load test samples with masks
+    # Load test samples with masks (NOW USING ORIGINAL IMAGES AS INPUT)
     test_samples = load_test_samples_with_masks(
         args.test_data_dir,
-        args.erased_folder,
-        args.mask_folder,
         args.orig_folder,
+        args.mask_folder,
+        args.erased_folder,
         args.num_samples if args.num_samples > 0 else 0,
-        args.compare_with_orig,
+        args.invert_masks,
     )
 
     if not test_samples:
@@ -499,7 +494,8 @@ def main():
     for i, sample in enumerate(tqdm(test_samples, desc="Processing samples")):
         try:
             # Resize images to target resolution
-            input_image = sample["erased_image"].resize(
+            # Use ORIGINAL image as input (not erased!)
+            input_image = sample["original_image"].resize(
                 (args.resolution, args.resolution), Image.Resampling.LANCZOS
             )
             mask_image = sample["mask_image"].resize(
@@ -510,8 +506,8 @@ def main():
             with torch.autocast("cuda" if torch.cuda.is_available() else "cpu"):
                 generated_image = pipe(
                     prompt=sample["prompt"],
-                    image=input_image,
-                    mask_image=mask_image,
+                    image=input_image,  # ORIGINAL image with damage
+                    mask_image=mask_image,  # INVERTED mask (white = inpaint)
                     height=args.resolution,
                     width=args.resolution,
                     num_inference_steps=args.num_inference_steps,
@@ -521,18 +517,15 @@ def main():
                     ).manual_seed(args.seed + i),
                 ).images[0]
 
-            # Calculate metrics if original is available
+            # Calculate metrics
             metrics = {}
-            original_resized = None
-
-            if sample["orig_image"] is not None:
-                original_resized = sample["orig_image"].resize(
-                    (args.resolution, args.resolution), Image.Resampling.LANCZOS
-                )
-                metrics = calculate_inpainting_metrics(
-                    original_resized, generated_image, mask_image
-                )
-                all_metrics.append(metrics)
+            ground_truth_resized = sample["ground_truth"].resize(
+                (args.resolution, args.resolution), Image.Resampling.LANCZOS
+            )
+            metrics = calculate_inpainting_metrics(
+                ground_truth_resized, generated_image, mask_image
+            )
+            all_metrics.append(metrics)
 
             # Save individual files
             base_filename = f"{i:03d}_{sample['emoji_id']}_{sample['base_name']}"
@@ -548,14 +541,25 @@ def main():
             )
             mask_image.save(os.path.join(args.output_dir, f"{base_filename}_mask.png"))
 
-            if sample["orig_image"] is not None:
-                sample["orig_image"].save(
-                    os.path.join(args.output_dir, f"{base_filename}_original.png")
+            # Save ground truth
+            sample["ground_truth"].save(
+                os.path.join(args.output_dir, f"{base_filename}_ground_truth.png")
+            )
+
+            # Save erased image for comparison if available
+            if sample["erased_image"] is not None:
+                sample["erased_image"].save(
+                    os.path.join(args.output_dir, f"{base_filename}_erased.png")
                 )
 
             # Create and save visualization
             fig = create_inpainting_visualization(
-                input_image, mask_image, generated_image, original_resized, metrics
+                input_image,
+                mask_image,
+                generated_image,
+                ground_truth_resized,
+                sample["erased_image"],
+                metrics,
             )
             fig.savefig(
                 os.path.join(args.output_dir, f"{base_filename}_comparison.png"),
@@ -571,8 +575,7 @@ def main():
                     "emoji_id": sample["emoji_id"],
                     "prompt": sample["prompt"],
                     "base_name": sample["base_name"],
-                    "erased_file": sample["erased_filename"],
-                    "mask_file": sample["mask_filename"],
+                    "mask_inverted": args.invert_masks,
                     "metrics": metrics,
                 }
             )
@@ -596,33 +599,35 @@ def main():
 
         for metric_name in metric_names:
             values = [m[metric_name] for m in all_metrics if metric_name in m]
-            if values:
-                summary[f"{metric_name}_mean"] = float(np.mean(values))
-                summary[f"{metric_name}_std"] = float(np.std(values))
-                summary[f"{metric_name}_min"] = float(np.min(values))
-                summary[f"{metric_name}_max"] = float(np.max(values))
+            if values and not np.isinf(values).all():  # Skip if all values are inf
+                valid_values = [v for v in values if not np.isinf(v)]
+                if valid_values:
+                    summary[f"{metric_name}_mean"] = float(np.mean(valid_values))
+                    summary[f"{metric_name}_std"] = float(np.std(valid_values))
+                    summary[f"{metric_name}_min"] = float(np.min(valid_values))
+                    summary[f"{metric_name}_max"] = float(np.max(valid_values))
 
-                # Print formatted results
-                if "psnr" in metric_name:
-                    print(
-                        f"{metric_name.replace('_', ' ').title()}: "
-                        f"{np.mean(values):.2f} ± {np.std(values):.2f} dB"
-                    )
-                elif "mse" in metric_name:
-                    print(
-                        f"{metric_name.replace('_', ' ').title()}: "
-                        f"{np.mean(values):.6f} ± {np.std(values):.6f}"
-                    )
-                elif "ratio" in metric_name:
-                    print(
-                        f"{metric_name.replace('_', ' ').title()}: "
-                        f"{np.mean(values) * 100:.1f} ± {np.std(values) * 100:.1f}%"
-                    )
-                else:
-                    print(
-                        f"{metric_name.replace('_', ' ').title()}: "
-                        f"{np.mean(values):.4f} ± {np.std(values):.4f}"
-                    )
+                    # Print formatted results
+                    if "psnr" in metric_name:
+                        print(
+                            f"{metric_name.replace('_', ' ').title()}: "
+                            f"{np.mean(valid_values):.2f} ± {np.std(valid_values):.2f} dB"
+                        )
+                    elif "mse" in metric_name:
+                        print(
+                            f"{metric_name.replace('_', ' ').title()}: "
+                            f"{np.mean(valid_values):.6f} ± {np.std(valid_values):.6f}"
+                        )
+                    elif "ratio" in metric_name:
+                        print(
+                            f"{metric_name.replace('_', ' ').title()}: "
+                            f"{np.mean(valid_values) * 100:.1f} ± {np.std(valid_values) * 100:.1f}%"
+                        )
+                    elif "pixels" in metric_name:
+                        print(
+                            f"{metric_name.replace('_', ' ').title()}: "
+                            f"{np.mean(valid_values):.0f} ± {np.std(valid_values):.0f}"
+                        )
 
         # Save detailed results
         results_file = os.path.join(args.output_dir, "evaluation_results.json")
