@@ -495,7 +495,7 @@ def setup_models_64x64(args):
 
         # Use LoRAAttnProcessor2_0 with correct parameters
         lora_attn_procs[name] = LoRAAttnProcessor2_0(
-            hidden_size=hidden_size,
+            hidden_size,
             cross_attention_dim=cross_attention_dim,
             rank=args.lora_rank,
             network_alpha=args.lora_rank,  # Can be same as rank
