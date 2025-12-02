@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stable Diffusion LoRA Training - Fixed Version
+Stable Diffusion LoRA Training - Corrected for UNet dimensions
 """
 
 import argparse
@@ -25,24 +25,24 @@ from tqdm import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 # ============================================================================
-# DATASET (SAME AS BEFORE)
+# DATASET WITH PROPER RESIZING
 # ============================================================================
 
 
 class StableDiffusionDataset(Dataset):
     """Dataset untuk fine-tuning Stable Diffusion"""
 
-    def __init__(self, data_path, tokenizer, resolution=64, is_test=False):
+    def __init__(self, data_path, tokenizer, image_size=512, is_test=False):
         """
         Args:
             data_path: Path to dataset directory
             tokenizer: CLIP tokenizer
-            resolution: Image resolution
+            image_size: Input image size (512 for SD 1.5)
             is_test: If True, treat as test dataset where orig folder is optional
         """
         self.data_path = Path(data_path)
         self.tokenizer = tokenizer
-        self.resolution = resolution
+        self.image_size = image_size  # SD 1.5 expects 512x512 images
         self.is_test = is_test
 
         self.erased_dir = self.data_path / "erased"
@@ -147,10 +147,10 @@ class StableDiffusionDataset(Dataset):
         else:
             original = erased.copy()
 
-        # Resize
-        original = original.resize((self.resolution, self.resolution), Image.LANCZOS)
-        erased = erased.resize((self.resolution, self.resolution), Image.LANCZOS)
-        mask = mask.resize((self.resolution, self.resolution), Image.LANCZOS)
+        # Resize to 512x512 for Stable Diffusion
+        original = original.resize((self.image_size, self.image_size), Image.LANCZOS)
+        erased = erased.resize((self.image_size, self.image_size), Image.LANCZOS)
+        mask = mask.resize((self.image_size, self.image_size), Image.LANCZOS)
 
         # Convert to tensor & normalize to [-1, 1]
         original = torch.from_numpy(np.array(original)).float() / 127.5 - 1.0
@@ -160,7 +160,7 @@ class StableDiffusionDataset(Dataset):
         # Permute to CHW
         original = original.permute(2, 0, 1)
         erased = erased.permute(2, 0, 1)
-        mask = mask.unsqueeze(0)
+        mask = mask.unsqueeze(0)  # Add channel dimension
 
         # Simple prompt with only emoji_id
         emoji_id = item["emoji_id"]
@@ -187,13 +187,13 @@ class StableDiffusionDataset(Dataset):
 
 
 # ============================================================================
-# SIMPLE APPROACH: TRAIN SELECTED LAYERS (NO LoRA COMPLEXITY)
+# SETUP MODELS WITH CORRECT DIMENSIONS
 # ============================================================================
 
 
-def setup_models_simple(args):
-    """Simple setup without LoRA - train selected attention layers"""
-    print("Loading models...")
+def setup_models_correct(args):
+    """Setup models with correct dimensions for Stable Diffusion"""
+    print("Setting up models with correct dimensions...")
 
     # Load tokenizer
     tokenizer = CLIPTokenizer.from_pretrained(args.model_name, subfolder="tokenizer")
@@ -214,103 +214,66 @@ def setup_models_simple(args):
     unet = UNet2DConditionModel.from_pretrained(args.model_name, subfolder="unet")
     unet.to(args.device)
 
-    # Freeze all parameters first
+    # Freeze UNet initially
     unet.requires_grad_(False)
 
-    # Unfreeze only attention layers (q, k, v, proj_out)
-    trainable_params = []
-    for name, param in unet.named_parameters():
-        # Train attention query, key, value, and output projection layers
-        if any(x in name for x in ["to_q", "to_k", "to_v", "to_out.0", "proj_out"]):
-            param.requires_grad = True
-            trainable_params.append(param)
-        # Also train attention processors if they exist
-        elif "processor" in name and "weight" in name:
-            param.requires_grad = True
-            trainable_params.append(param)
+    # Enable LoRA using diffusers built-in method
+    print(f"Setting up LoRA with rank={args.lora_rank}...")
 
-    print(f"Trainable parameters: {len(trainable_params)}")
-    print(f"Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
-
-    # Noise scheduler
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        args.model_name, subfolder="scheduler"
+    from diffusers.models.attention_processor import (
+        LoRAAttnProcessor,
+        LoRAAttnProcessor2_0,
     )
 
-    return tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params
-
-
-# ============================================================================
-# WORKING LoRA USING DIFFUSERS BUILT-IN
-# ============================================================================
-
-
-def setup_models_diffusers_lora(args):
-    """Use diffusers built-in LoRA support"""
-    print("Setting up diffusers LoRA...")
-
-    # Create pipeline
-    pipe = StableDiffusionPipeline.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.float16 if args.device == "cuda" else torch.float32,
-    )
-
-    # Freeze all components
-    pipe.text_encoder.requires_grad_(False)
-    pipe.vae.requires_grad_(False)
-    pipe.unet.requires_grad_(False)
-
-    # Enable LoRA for UNet using diffusers built-in method
-    from diffusers.loaders import UNet2DConditionLoadersMixin
-
-    # Set up LoRA
+    # Set attention processors to LoRA
     lora_attn_procs = {}
-    for name, attn_processor in pipe.unet.attn_processors.items():
-        # Create LoRA attention processor
+
+    for name, attn_processor in unet.attn_processors.items():
         cross_attention_dim = (
             None
             if name.endswith("attn1.processor")
-            else pipe.unet.config.cross_attention_dim
+            else unet.config.cross_attention_dim
         )
 
+        # Get hidden size based on block
         if name.startswith("mid_block"):
-            hidden_size = pipe.unet.config.block_out_channels[-1]
+            hidden_size = unet.config.block_out_channels[-1]
         elif name.startswith("up_blocks"):
             block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(pipe.unet.config.block_out_channels))[block_id]
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
         elif name.startswith("down_blocks"):
             block_id = int(name[len("down_blocks.")])
-            hidden_size = pipe.unet.config.block_out_channels[block_id]
+            hidden_size = unet.config.block_out_channels[block_id]
+        else:
+            hidden_size = None
 
-        # Use LoRAAttnProcessor
-        from diffusers.models.attention_processor import LoRAAttnProcessor
+        if hidden_size is None:
+            continue
 
-        lora_attn_procs[name] = LoRAAttnProcessor(
+        # Choose processor class
+        if hasattr(F, "scaled_dot_product_attention"):
+            attn_processor_class = LoRAAttnProcessor2_0
+        else:
+            attn_processor_class = LoRAAttnProcessor
+
+        lora_attn_procs[name] = attn_processor_class(
             hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
             rank=args.lora_rank,
         )
 
-    pipe.unet.set_attn_processor(lora_attn_procs)
+    # Set the processors
+    unet.set_attn_processor(lora_attn_procs)
 
-    # Count trainable parameters
+    # Collect trainable parameters (only LoRA)
     trainable_params = []
-    for name, param in pipe.unet.named_parameters():
+    for name, param in unet.named_parameters():
         if "lora" in name:
             param.requires_grad = True
             trainable_params.append(param)
 
     print(f"Trainable LoRA parameters: {sum(p.numel() for p in trainable_params):,}")
 
-    # Move to device
-    pipe = pipe.to(args.device)
-
-    # Extract components
-    unet = pipe.unet
-    vae = pipe.vae
-    text_encoder = pipe.text_encoder
-    tokenizer = pipe.tokenizer
-
     # Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.model_name, subfolder="scheduler"
@@ -320,24 +283,24 @@ def setup_models_diffusers_lora(args):
 
 
 # ============================================================================
-# TRAINING FUNCTION
+# TRAINING FUNCTION WITH CORRECT LATENT DIMENSIONS
 # ============================================================================
 
 
-def train_simple(args):
-    """Simple training without LoRA complexity"""
-    print("Starting training...")
+def train_correct(args):
+    """Training with correct latent dimensions"""
+    print("Starting training with correct dimensions...")
 
     # Setup models
     tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params = (
-        setup_models_simple(args)
+        setup_models_correct(args)
     )
 
     # Training dataset
     train_dataset = StableDiffusionDataset(
         data_path=args.train_data,
         tokenizer=tokenizer,
-        resolution=args.resolution,
+        image_size=512,  # Stable Diffusion expects 512x512
         is_test=False,
     )
 
@@ -349,8 +312,8 @@ def train_simple(args):
     )
 
     print(f"Training on {len(train_dataset)} samples")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Total iterations per epoch: {len(train_dataloader)}")
+    print(f"Image size: 512x512 (SD 1.5 standard)")
+    print(f"Latent size: 64x64 (512/8)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
@@ -370,9 +333,13 @@ def train_simple(args):
             original = batch["original"].to(args.device)
             input_ids = batch["input_ids"].to(args.device)
 
-            # Encode images to latent space
+            # Encode images to latent space (512 -> 64 latents)
             with torch.no_grad():
-                latents_original = vae.encode(original).latent_dist.sample() * 0.18215
+                # Encode to latents: (B, 3, 512, 512) -> (B, 4, 64, 64)
+                latents_original = vae.encode(original).latent_dist.sample()
+
+                # Scale latents (following standard SD practice)
+                latents_original = latents_original * 0.18215
 
                 # Get text embeddings
                 if args.use_text_conditioning:
@@ -396,7 +363,7 @@ def train_simple(args):
                 latents_original, noise, timesteps
             )
 
-            # Predict noise
+            # Predict noise - LATENTS SHOULD BE (B, 4, 64, 64)
             noise_pred = unet(
                 noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states
             ).sample
@@ -416,6 +383,22 @@ def train_simple(args):
             # Update metrics
             epoch_loss += loss.item()
 
+            # Print debug info occasionally
+            if batch_idx == 0:
+                print(f"\nDebug info:")
+                print(
+                    f"  Original shape: {original.shape}"
+                )  # Should be (B, 3, 512, 512)
+                print(
+                    f"  Latents shape: {latents_original.shape}"
+                )  # Should be (B, 4, 64, 64)
+                print(
+                    f"  Noise pred shape: {noise_pred.shape}"
+                )  # Should be (B, 4, 64, 64)
+                print(
+                    f"  Encoder hidden states: {encoder_hidden_states.shape if encoder_hidden_states is not None else 'None'}"
+                )
+
             progress_bar.set_postfix({"loss": loss.item()})
 
         avg_loss = epoch_loss / len(train_dataloader)
@@ -424,55 +407,149 @@ def train_simple(args):
         # Save checkpoint
         if (epoch + 1) % args.save_every_n_epochs == 0:
             checkpoint_path = os.path.join(
-                args.checkpoint_dir, f"unet_epoch_{epoch + 1}.pt"
+                args.checkpoint_dir, f"lora_epoch_{epoch + 1}.safetensors"
             )
 
-            # Save only trainable parameters
-            state_dict = {}
-            for name, param in unet.named_parameters():
-                if param.requires_grad:
-                    state_dict[name] = param.data
-
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "state_dict": state_dict,
-                    "loss": avg_loss,
-                },
-                checkpoint_path,
+            # Save LoRA weights using diffusers method
+            unet.save_attn_procs(
+                args.checkpoint_dir, weight_name=f"lora_epoch_{epoch + 1}.safetensors"
             )
             print(f"Checkpoint saved to {checkpoint_path}")
 
+            # Also save optimizer state
+            optimizer_path = os.path.join(
+                args.checkpoint_dir, f"optimizer_epoch_{epoch + 1}.pt"
+            )
+            torch.save(optimizer.state_dict(), optimizer_path)
+
     print("Training completed!")
 
-    # Save final model
-    final_path = os.path.join(args.checkpoint_dir, "unet_final.pt")
-
-    state_dict = {}
-    for name, param in unet.named_parameters():
-        if param.requires_grad:
-            state_dict[name] = param.data
-
-    torch.save({"state_dict": state_dict, "args": vars(args)}, final_path)
-    print(f"Final model saved to {final_path}")
+    # Save final LoRA weights
+    final_path = os.path.join(args.checkpoint_dir, "lora_final.safetensors")
+    unet.save_attn_procs(args.checkpoint_dir, weight_name="lora_final.safetensors")
+    print(f"Final LoRA weights saved to {final_path}")
 
     return unet
 
 
-def train_with_diffusers_lora(args):
-    """Train using diffusers built-in LoRA"""
-    print("Training with diffusers LoRA...")
+# ============================================================================
+# ALTERNATIVE: FINE-TUNE ON 64x64 DIRECTLY (CUSTOM DIMENSIONS)
+# ============================================================================
+
+
+def setup_models_64x64(args):
+    """Setup for 64x64 images - custom UNet configuration"""
+    print("Setting up for 64x64 images...")
+
+    # Load tokenizer
+    tokenizer = CLIPTokenizer.from_pretrained(args.model_name, subfolder="tokenizer")
+
+    # Load text encoder
+    text_encoder = CLIPTextModel.from_pretrained(
+        args.model_name, subfolder="text_encoder"
+    )
+    text_encoder.to(args.device)
+    text_encoder.requires_grad_(False)
+
+    # Load VAE
+    vae = AutoencoderKL.from_pretrained(args.model_name, subfolder="vae")
+    vae.to(args.device)
+    vae.requires_grad_(False)
+
+    # Load UNet - but we need to handle 64x64 images
+    # For 64x64 images, latents will be 8x8 (64/8)
+    unet = UNet2DConditionModel.from_pretrained(args.model_name, subfolder="unet")
+
+    # Check UNet configuration
+    print(f"UNet config:")
+    print(f"  Sample size: {unet.config.sample_size}")  # Should be 64 for SD 1.5
+    print(f"  In channels: {unet.config.in_channels}")  # Should be 4
+    print(f"  Out channels: {unet.config.out_channels}")  # Should be 4
+
+    # For 64x64 images, we need to handle scaling
+    # VAE downsampling factor is 8, so 64x64 -> 8x8 latents
+    unet.to(args.device)
+
+    # Enable LoRA
+    print(f"Setting up LoRA for 64x64 training...")
+
+    from diffusers.models.attention_processor import (
+        LoRAAttnProcessor,
+        LoRAAttnProcessor2_0,
+    )
+
+    lora_attn_procs = {}
+
+    for name, attn_processor in unet.attn_processors.items():
+        cross_attention_dim = (
+            None
+            if name.endswith("attn1.processor")
+            else unet.config.cross_attention_dim
+        )
+
+        # Get hidden size
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = unet.config.block_out_channels[block_id]
+        else:
+            hidden_size = None
+
+        if hidden_size is None:
+            continue
+
+        # Choose processor
+        if hasattr(F, "scaled_dot_product_attention"):
+            attn_processor_class = LoRAAttnProcessor2_0
+        else:
+            attn_processor_class = LoRAAttnProcessor
+
+        lora_attn_procs[name] = attn_processor_class(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=args.lora_rank,
+        )
+
+    unet.set_attn_processor(lora_attn_procs)
+
+    # Freeze UNet, only train LoRA
+    unet.requires_grad_(False)
+
+    # Collect trainable parameters
+    trainable_params = []
+    for name, param in unet.named_parameters():
+        if "lora" in name:
+            param.requires_grad = True
+            trainable_params.append(param)
+
+    print(f"Trainable LoRA parameters: {sum(p.numel() for p in trainable_params):,}")
+
+    # Noise scheduler
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        args.model_name, subfolder="scheduler"
+    )
+
+    return tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params
+
+
+def train_64x64(args):
+    """Train on 64x64 images directly"""
+    print("Training on 64x64 images...")
 
     # Setup models
     tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params = (
-        setup_models_diffusers_lora(args)
+        setup_models_64x64(args)
     )
 
-    # Training dataset
+    # Training dataset - use 64x64 images
     train_dataset = StableDiffusionDataset(
         data_path=args.train_data,
         tokenizer=tokenizer,
-        resolution=args.resolution,
+        image_size=64,  # Use 64x64 images
         is_test=False,
     )
 
@@ -482,6 +559,9 @@ def train_with_diffusers_lora(args):
         shuffle=True,
         num_workers=args.num_workers,
     )
+
+    print(f"Training on {len(train_dataset)} 64x64 samples")
+    print(f"Latent size will be: 8x8 (64/8)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
@@ -501,15 +581,24 @@ def train_with_diffusers_lora(args):
             original = batch["original"].to(args.device)
             input_ids = batch["input_ids"].to(args.device)
 
-            # Encode images to latent space
+            # Encode 64x64 images to latent space (64 -> 8 latents)
             with torch.no_grad():
-                latents_original = vae.encode(original).latent_dist.sample() * 0.18215
+                # For 64x64 images, VAE will output 8x8 latents
+                latents_original = vae.encode(original).latent_dist.sample()
+                latents_original = latents_original * 0.18215
 
                 # Get text embeddings
                 if args.use_text_conditioning:
                     encoder_hidden_states = text_encoder(input_ids)[0]
                 else:
                     encoder_hidden_states = None
+
+            # Debug shapes
+            if batch_idx == 0 and epoch == 0:
+                print(f"\nDebug shapes for 64x64 training:")
+                print(f"  Input images: {original.shape}")  # (B, 3, 64, 64)
+                print(f"  Latents: {latents_original.shape}")  # Should be (B, 4, 8, 8)
+                print(f"  UNet sample size config: {unet.config.sample_size}")
 
             # Sample noise
             noise = torch.randn_like(latents_original)
@@ -538,6 +627,7 @@ def train_with_diffusers_lora(args):
             # Backprop
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
 
             # Update metrics
@@ -551,64 +641,24 @@ def train_with_diffusers_lora(args):
         # Save checkpoint
         if (epoch + 1) % args.save_every_n_epochs == 0:
             checkpoint_path = os.path.join(
-                args.checkpoint_dir, f"lora_epoch_{epoch + 1}.safetensors"
+                args.checkpoint_dir, f"lora_64x64_epoch_{epoch + 1}.safetensors"
             )
-
-            # Save LoRA weights using diffusers method
             unet.save_attn_procs(
-                args.checkpoint_dir, weight_name=f"lora_epoch_{epoch + 1}.safetensors"
+                args.checkpoint_dir,
+                weight_name=f"lora_64x64_epoch_{epoch + 1}.safetensors",
             )
             print(f"Checkpoint saved to {checkpoint_path}")
 
     print("Training completed!")
 
-    # Save final LoRA weights
-    final_path = os.path.join(args.checkpoint_dir, "lora_final.safetensors")
-    unet.save_attn_procs(args.checkpoint_dir, weight_name="lora_final.safetensors")
+    # Save final
+    final_path = os.path.join(args.checkpoint_dir, "lora_64x64_final.safetensors")
+    unet.save_attn_procs(
+        args.checkpoint_dir, weight_name="lora_64x64_final.safetensors"
+    )
     print(f"Final LoRA weights saved to {final_path}")
 
     return unet
-
-
-# ============================================================================
-# EVALUATION
-# ============================================================================
-
-
-def evaluate_model(model_path, args):
-    """Evaluate trained model"""
-    print(f"Evaluating model from {model_path}")
-
-    # Load pipeline
-    pipe = StableDiffusionPipeline.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.float16 if args.device == "cuda" else torch.float32,
-    )
-
-    # Load LoRA weights
-    if model_path.endswith(".safetensors"):
-        pipe.unet.load_attn_procs(model_path)
-    else:
-        # Try to load as state dict
-        state_dict = torch.load(model_path, map_location="cpu")
-        if "state_dict" in state_dict:
-            pipe.unet.load_state_dict(state_dict["state_dict"], strict=False)
-        else:
-            pipe.unet.load_state_dict(state_dict, strict=False)
-
-    pipe = pipe.to(args.device)
-
-    # Generate test images
-    test_prompts = ["emoji 1", "emoji 2", "emoji 3", "emoji 4"]
-
-    os.makedirs("./evaluation", exist_ok=True)
-
-    for i, prompt in enumerate(test_prompts):
-        image = pipe(prompt, num_inference_steps=50).images[0]
-        image.save(f"./evaluation/test_{i:03d}.png")
-        print(f"Generated: {prompt}")
-
-    print("Evaluation complete!")
 
 
 # ============================================================================
@@ -617,7 +667,7 @@ def evaluate_model(model_path, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Stable Diffusion")
+    parser = argparse.ArgumentParser(description="Train Stable Diffusion with LoRA")
 
     # Dataset paths
     parser.add_argument(
@@ -638,9 +688,11 @@ def main():
         "--use_text_conditioning", action="store_true", help="Use text conditioning"
     )
     parser.add_argument(
-        "--use_lora",
-        action="store_true",
-        help="Use diffusers LoRA (otherwise train selected layers)",
+        "--image_size",
+        type=int,
+        choices=[64, 512],
+        default=64,
+        help="Image size for training (64 or 512)",
     )
 
     # Training hyperparameters
@@ -649,7 +701,6 @@ def main():
     parser.add_argument(
         "--learning_rate", type=float, default=1e-4, help="Learning rate"
     )
-    parser.add_argument("--resolution", type=int, default=64, help="Image resolution")
 
     # Checkpoint settings
     parser.add_argument(
@@ -663,14 +714,6 @@ def main():
         type=int,
         default=5,
         help="Save checkpoint every N epochs",
-    )
-
-    # Evaluation
-    parser.add_argument(
-        "--evaluate", action="store_true", help="Evaluate instead of train"
-    )
-    parser.add_argument(
-        "--model_path", type=str, default=None, help="Path to model for evaluation"
     )
 
     # System settings
@@ -698,19 +741,13 @@ def main():
     for key, value in vars(args).items():
         print(f"  {key}: {value}")
 
-    # Run training or evaluation
-    if args.evaluate:
-        if not args.model_path:
-            print("Error: --model_path required for evaluation")
-            return
-        evaluate_model(args.model_path, args)
-    else:
-        if args.use_lora:
-            print("\nUsing diffusers built-in LoRA...")
-            train_with_diffusers_lora(args)
-        else:
-            print("\nUsing simple training (selected layers)...")
-            train_simple(args)
+    # Choose training method based on image size
+    if args.image_size == 512:
+        print("\nTraining on 512x512 images (standard SD 1.5)...")
+        train_correct(args)
+    else:  # 64x64
+        print("\nTraining on 64x64 images...")
+        train_64x64(args)
 
 
 if __name__ == "__main__":
