@@ -220,7 +220,7 @@ def setup_models_correct(args):
     # Enable LoRA using diffusers built-in method
     print(f"Setting up LoRA with rank={args.lora_rank}...")
 
-    from diffusers.models.attention_processor import LoRAAttnProcessor
+    from diffusers.models.attention_processor import LoRAAttnProcessor2_0
 
     # Set attention processors to LoRA
     lora_attn_procs = {}
@@ -247,11 +247,12 @@ def setup_models_correct(args):
         if hidden_size is None:
             continue
 
-        # Use LoRAAttnProcessor for compatibility
-        lora_attn_procs[name] = LoRAAttnProcessor(
+        # Use LoRAAttnProcessor2_0 with correct parameters
+        lora_attn_procs[name] = LoRAAttnProcessor2_0(
             hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
             rank=args.lora_rank,
+            network_alpha=args.lora_rank,
         )
 
     # Set the processors
@@ -465,7 +466,7 @@ def setup_models_64x64(args):
     # Enable LoRA
     print(f"Setting up LoRA with rank={args.lora_rank}...")
 
-    from diffusers.models.attention_processor import LoRAAttnProcessor
+    from diffusers.models.attention_processor import LoRAAttnProcessor2_0
 
     # Set attention processors to LoRA
     lora_attn_procs = {}
@@ -492,11 +493,12 @@ def setup_models_64x64(args):
         if hidden_size is None:
             continue
 
-        # Use LoRAAttnProcessor (compatible with all PyTorch versions)
-        lora_attn_procs[name] = LoRAAttnProcessor(
+        # Use LoRAAttnProcessor2_0 with correct parameters
+        lora_attn_procs[name] = LoRAAttnProcessor2_0(
             hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
             rank=args.lora_rank,
+            network_alpha=args.lora_rank,  # Can be same as rank
         )
 
     # Set the processors
