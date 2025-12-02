@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Stable Diffusion LoRA Training - Adapted for your dataset structure
-Updated to use PEFT library instead of deprecated LoRAAttnProcessor
+Stable Diffusion LoRA Training - FIXED VERSION
+Uses erased images + masks where black = damage area
 """
 
 import argparse
@@ -24,7 +24,7 @@ from diffusers.optimization import get_scheduler
 # PEFT imports
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
-from PIL import Image
+from PIL import Image, ImageOps
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -33,22 +33,53 @@ from transformers import CLIPTextModel, CLIPTokenizer
 logger = get_logger(__name__)
 
 
-def prepare_mask_and_masked_image(image, mask):
-    """Prepare mask and masked image for inpainting"""
-    image = np.array(image.convert("RGB"))
-    image = image[None].transpose(0, 3, 1, 2)
-    image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
+def prepare_mask_and_masked_image(original_image, mask_image, erased_image=None):
+    """Prepare mask and masked image for inpainting training
 
-    mask = np.array(mask.convert("L"))
-    mask = mask.astype(np.float32) / 255.0
-    mask = mask[None, None]
-    mask[mask < 0.5] = 0
-    mask[mask >= 0.5] = 1
-    mask = torch.from_numpy(mask)
+    Args:
+        original_image: PIL Image of original complete image (target)
+        mask_image: PIL Image mask where BLACK = damage area, WHITE = intact
+        erased_image: PIL Image with white/blank where damage was (input)
 
-    masked_image = image * (mask < 0.5)
+    Returns:
+        mask: Tensor where 1 = inpaint (damage), 0 = keep (intact)
+        masked_image: Tensor of erased image (white where damage was)
+    """
+    # Convert original image to tensor [-1, 1]
+    orig_np = np.array(original_image.convert("RGB"))
+    orig_np = orig_np[None].transpose(0, 3, 1, 2)
+    orig_tensor = torch.from_numpy(orig_np).to(dtype=torch.float32) / 127.5 - 1.0
 
-    return mask, masked_image
+    # Convert mask: black (damage) -> 1 (inpaint), white (intact) -> 0 (keep)
+    mask_np = np.array(mask_image.convert("L"))
+    mask_np = mask_np.astype(np.float32) / 255.0
+
+    # INVERT: Since black=damage in your masks, we need white=1 for inpainting
+    # But actually, we want to keep the original mask values:
+    # black (0) -> damage -> should inpaint -> should be 1
+    # white (255) -> intact -> should keep -> should be 0
+    # So we need: mask = 1 - mask_np (or threshold differently)
+
+    mask_np = 1.0 - mask_np  # Invert: now white=damage, black=intact
+    mask_np = mask_np[None, None]
+    mask_np[mask_np < 0.5] = 0  # Make binary: values < 0.5 become 0
+    mask_np[mask_np >= 0.5] = 1  # Values >= 0.5 become 1
+    mask_tensor = torch.from_numpy(mask_np)
+
+    # Use erased image directly as masked image
+    if erased_image is not None:
+        erased_np = np.array(erased_image.convert("RGB"))
+        erased_np = erased_np[None].transpose(0, 3, 1, 2)
+        masked_tensor = (
+            torch.from_numpy(erased_np).to(dtype=torch.float32) / 127.5 - 1.0
+        )
+    else:
+        # Fallback: create masked image from original
+        masked_tensor = orig_tensor * (
+            1 - mask_tensor
+        )  # Keep intact areas, black out damage
+
+    return mask_tensor, masked_tensor
 
 
 def parse_args():
@@ -60,7 +91,7 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="runwayml/stable-diffusion-v1-5",
+        default="runwayml/stable-diffusion-inpainting",  # Use inpainting model!
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -223,6 +254,7 @@ class InpaintingDataset(Dataset):
     """
     Dataset for inpainting training with your folder structure.
     Expects: train_data_dir/erased/, train_data_dir/masks/, train_data_dir/orig/
+    Uses: erased images + masks (black=damage) as input, original images as target
     """
 
     def __init__(
@@ -267,13 +299,6 @@ class InpaintingDataset(Dataset):
             ]
         )
 
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-
     def __len__(self):
         return len(self.erased_files)
 
@@ -300,6 +325,7 @@ class InpaintingDataset(Dataset):
         # Apply transforms
         erased_image = self.image_transforms_resize_and_crop(erased_image)
         orig_image = self.image_transforms_resize_and_crop(orig_image)
+        mask_image = mask_image.resize(orig_image.size, Image.NEAREST)
 
         # Tokenize prompt
         prompt_ids = self.tokenizer(
@@ -310,9 +336,9 @@ class InpaintingDataset(Dataset):
         ).input_ids
 
         return {
-            "erased_image": erased_image,  # Will be used as input
-            "orig_image": orig_image,  # Will be used as target
-            "mask": mask_image,  # Will be used for inpainting
+            "erased_image": erased_image,  # Image with white where damage was
+            "orig_image": orig_image,  # Complete original image (target)
+            "mask": mask_image,  # Black = damage area, White = intact
             "prompt_ids": prompt_ids,
             "prompt": prompt,
         }
@@ -327,15 +353,21 @@ class CollateFn:
     def __call__(self, examples):
         """Collate function for the dataloader"""
         input_ids = [example["prompt_ids"] for example in examples]
-        pixel_values = [
-            example["orig_image"] for example in examples
-        ]  # Use original as target
 
-        # Convert images to tensors
-        pixel_values = [transforms.ToTensor()(img) for img in pixel_values]
-        pixel_values = [transforms.Normalize([0.5], [0.5])(img) for img in pixel_values]
-        pixel_values = torch.stack(pixel_values)
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        # Target images (original complete images)
+        target_images = [example["orig_image"] for example in examples]
+
+        # Convert target images to tensors
+        target_tensors = []
+        for img in target_images:
+            img_tensor = transforms.ToTensor()(img)
+            img_tensor = transforms.Normalize([0.5], [0.5])(img_tensor)
+            target_tensors.append(img_tensor)
+
+        target_tensors = torch.stack(target_tensors)
+        target_tensors = target_tensors.to(
+            memory_format=torch.contiguous_format
+        ).float()
 
         # Prepare masks and masked images (erased images)
         masks = []
@@ -346,11 +378,10 @@ class CollateFn:
             erased_pil = example["erased_image"]
             mask_pil = example["mask"]
 
-            # Resize mask to match image size
-            mask_pil = mask_pil.resize(orig_pil.size, Image.NEAREST)
-
-            # Prepare mask and masked image
-            mask, masked_image = prepare_mask_and_masked_image(orig_pil, mask_pil)
+            # Prepare mask and masked image using erased image
+            mask, masked_image = prepare_mask_and_masked_image(
+                orig_pil, mask_pil, erased_pil
+            )
 
             masks.append(mask)
             masked_images.append(masked_image)
@@ -365,7 +396,7 @@ class CollateFn:
 
         return {
             "input_ids": input_ids,
-            "pixel_values": pixel_values,
+            "target_images": target_tensors,  # Renamed for clarity
             "masks": masks,
             "masked_images": masked_images,
         }
@@ -395,7 +426,7 @@ def main():
         args.pretrained_model_name_or_path, subfolder="tokenizer"
     )
 
-    # Load models
+    # Load models - USE INPAINTING MODEL!
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder"
     )
@@ -551,21 +582,24 @@ def main():
     )
     progress_bar.set_description("Steps")
 
+    # Debug: Check what we're feeding to the model (first batch only)
+    debug_printed = False
+
     for epoch in range(args.num_train_epochs):
         unet.train()
 
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
-                # Convert images to latent space
+                # Convert target images to latent space
                 latents = vae.encode(
-                    batch["pixel_values"].to(dtype=weight_dtype)
+                    batch["target_images"].to(dtype=weight_dtype)
                 ).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
-                # Convert masked images to latent space
+                # Convert masked images (erased images) to latent space
                 masked_latents = vae.encode(
                     batch["masked_images"]
-                    .reshape(batch["pixel_values"].shape)
+                    .reshape(batch["target_images"].shape)
                     .to(dtype=weight_dtype)
                 ).latent_dist.sample()
                 masked_latents = masked_latents * vae.config.scaling_factor
@@ -582,6 +616,29 @@ def main():
                 ).to(dtype=weight_dtype)
                 mask = mask.reshape(-1, 1, args.resolution // 8, args.resolution // 8)
 
+                # Debug output for first batch
+                if (
+                    not debug_printed
+                    and accelerator.is_local_main_process
+                    and step == 0
+                ):
+                    print("\n=== DEBUG INFORMATION (First Batch) ===")
+                    print(f"Mask statistics:")
+                    print(
+                        f"  Min: {mask.min().item():.3f}, Max: {mask.max().item():.3f}"
+                    )
+                    print(f"  Mean: {mask.mean().item():.3f}")
+                    print(
+                        f"  Values < 0.5: {(mask < 0.5).sum().item() / mask.numel() * 100:.1f}%"
+                    )
+                    print(
+                        f"  Values >= 0.5: {(mask >= 0.5).sum().item() / mask.numel() * 100:.1f}%"
+                    )
+                    print(
+                        f"Latent shapes: {latents.shape}, Mask: {mask.shape}, Masked: {masked_latents.shape}"
+                    )
+                    debug_printed = True
+
                 # Sample noise
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
@@ -597,7 +654,7 @@ def main():
                 # Add noise to latents
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Concatenate for inpainting
+                # Concatenate for inpainting: [noisy_latents, mask, masked_latents]
                 latent_model_input = torch.cat(
                     [noisy_latents, mask, masked_latents], dim=1
                 )
@@ -620,6 +677,13 @@ def main():
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
 
+                # Optionally: Apply mask to loss to focus on damaged areas
+                # mask_flat = mask.flatten(1)
+                # loss_per_pixel = F.mse_loss(noise_pred.float(), target.float(), reduction='none')
+                # loss_per_pixel = loss_per_pixel.flatten(1)
+                # loss = (loss_per_pixel * mask_flat).sum() / mask_flat.sum().clamp(min=1)
+
+                # Or use standard loss
                 loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
                 # Backward pass
