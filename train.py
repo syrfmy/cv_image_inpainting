@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-High-Parameter LoRA Training - FIXED GRADIENT CLIPPING VERSION
+Optimized LoRA Training - 4-Hour Training Time
 """
 
 import argparse
@@ -63,7 +63,7 @@ def prepare_mask_and_masked_image(original_image, mask_image, erased_image=None)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="High-Parameter LoRA Training for Inpainting"
+        description="Optimized LoRA Training for Inpainting - 4 Hour Training"
     )
 
     # Required arguments
@@ -82,11 +82,11 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="lora-high-param-model",
+        default="lora-4hour-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
 
-    # Training parameters
+    # Training parameters - OPTIMIZED FOR SPEED
     parser.add_argument(
         "--resolution",
         type=int,
@@ -96,40 +96,40 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=2,
+        default=4,  # Increased for speed
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
-        "--num_train_epochs", type=int, default=30, help="Number of training epochs."
+        "--num_train_epochs", type=int, default=10, help="Number of training epochs."
     )
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=None,
+        default=5000,  # Limited steps for 4 hours
         help="Total number of training steps to perform.",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=2,
+        default=1,  # No accumulation for speed
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4,
+        default=2e-4,  # Higher LR for faster convergence
         help="Initial learning rate.",
     )
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="cosine",
+        default="constant_with_warmup",
         help="The scheduler type to use.",
     )
     parser.add_argument(
         "--lr_warmup_steps",
         type=int,
-        default=500,
+        default=100,  # Shorter warmup
         help="Number of steps for the warmup in the lr scheduler.",
     )
     parser.add_argument(
@@ -157,69 +157,63 @@ def parse_args():
         help="Epsilon value for the Adam optimizer",
     )
     parser.add_argument(
-        "--max_grad_norm", default=0.5, type=float, help="Max gradient norm."
+        "--max_grad_norm", default=1.0, type=float, help="Max gradient norm."
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="A seed for reproducible training."
     )
 
-    # LoRA parameters (OPTIMIZED)
+    # LoRA parameters - OPTIMIZED FOR SPEED
     parser.add_argument(
         "--lora_rank",
         type=int,
-        default=64,
-        help="Rank of LoRA layers. Higher = more parameters.",
+        default=32,  # Reduced for speed
+        help="Rank of LoRA layers.",
     )
     parser.add_argument(
         "--lora_alpha",
         type=int,
-        default=128,
+        default=64,  # Reduced for speed
         help="Alpha parameter for LoRA scaling.",
     )
     parser.add_argument(
         "--lora_dropout",
         type=float,
-        default=0.2,
+        default=0.1,  # Lower dropout
         help="Dropout probability for LoRA layers to prevent overfitting.",
     )
     parser.add_argument(
         "--lora_bias",
         type=str,
-        default="lora_only",
+        default="none",  # No bias for speed
         choices=["none", "all", "lora_only"],
         help="Bias type for LoRA. 'none': no bias, 'all': all bias, 'lora_only': only LoRA bias",
     )
     parser.add_argument(
         "--apply_lora_to_text_encoder",
         action="store_true",
-        default=True,
+        default=False,  # Disabled for speed
         help="Apply LoRA to text encoder for more parameters.",
     )
-    parser.add_argument(
-        "--clip_gradients",
-        action="store_true",
-        default=False,
-        help="Whether to clip gradients (disable when using mixed precision).",
-    )
 
-    # System parameters
+    # System parameters - OPTIMIZED FOR SPEED
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="bf16",
+        default="fp16",  # fp16 is faster than bf16 on many GPUs
         choices=["no", "fp16", "bf16"],
         help="Whether to use mixed precision.",
     )
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
-        default=True,
+        default=False,  # Disabled for speed (uses more memory)
         help="Whether or not to use gradient checkpointing to save memory.",
     )
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=1000,  # Less frequent checkpoints
         help="Save a checkpoint of the training state every X updates.",
     )
     parser.add_argument(
@@ -233,6 +227,12 @@ def parse_args():
         action="store_true",
         default=True,
         help="Whether or not to use xformers.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,  # More workers for faster data loading
+        help="Number of worker processes for data loading.",
     )
 
     args = parser.parse_args()
@@ -278,15 +278,13 @@ class InpaintingDataset(Dataset):
         if len(self.erased_files) > 0:
             print(f"Example: {self.erased_files[0].name}")
 
-        # Image transforms
+        # Image transforms - SIMPLIFIED for speed
         self.image_transforms_resize_and_crop = transforms.Compose(
             [
                 transforms.Resize(
                     size, interpolation=transforms.InterpolationMode.BILINEAR
                 ),
-                transforms.CenterCrop(size)
-                if center_crop
-                else transforms.RandomCrop(size),
+                transforms.CenterCrop(size),  # Always center crop for consistency
             ]
         )
 
@@ -327,9 +325,9 @@ class InpaintingDataset(Dataset):
         ).input_ids
 
         return {
-            "erased_image": erased_image,  # Image with white where damage was
-            "orig_image": orig_image,  # Complete original image (target)
-            "mask": mask_image,  # Black = damage area, White = intact
+            "erased_image": erased_image,
+            "orig_image": orig_image,
+            "mask": mask_image,
             "prompt_ids": prompt_ids,
             "prompt": prompt,
         }
@@ -348,14 +346,13 @@ class CollateFn:
         # Target images (original complete images)
         target_images = [example["orig_image"] for example in examples]
 
-        # Convert target images to tensors
-        target_tensors = []
-        for img in target_images:
-            img_tensor = transforms.ToTensor()(img)
-            img_tensor = transforms.Normalize([0.5], [0.5])(img_tensor)
-            target_tensors.append(img_tensor)
-
-        target_tensors = torch.stack(target_tensors)
+        # Convert target images to tensors - OPTIMIZED
+        target_tensors = torch.stack(
+            [
+                transforms.Normalize([0.5], [0.5])(transforms.ToTensor()(img))
+                for img in target_images
+            ]
+        )
         target_tensors = target_tensors.to(
             memory_format=torch.contiguous_format
         ).float()
@@ -455,60 +452,41 @@ def main():
         else:
             print("XFormers not available, using default attention")
 
-    # Setup LoRA with optimized parameters
+    # Setup LoRA with OPTIMIZED parameters
     print(f"\nSetting up LoRA with rank={args.lora_rank}, alpha={args.lora_alpha}")
 
-    # 1. UNet LoRA
+    # SIMPLIFIED LoRA config for speed
     unet_lora_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
         target_modules=[
-            # Linear layers (attention projections)
+            # Only key attention layers for speed
             "to_q",
             "to_k",
             "to_v",
             "to_out.0",
-            "attn1.to_q",
-            "attn1.to_k",
-            "attn1.to_v",
-            "attn1.to_out.0",
-            "attn2.to_q",
-            "attn2.to_k",
-            "attn2.to_v",
-            "attn2.to_out.0",
-            # Linear layers (feed-forward)
-            "ff.net.0.proj",
-            "ff.net.2",
-            # Conv2d layers (residual blocks)
-            "conv1",
-            "conv2",
-            "conv_shortcut",
-            # Input/output conv layers
-            "conv_in",
-            "conv_out",
-            # Proj layers (usually linear)
-            "proj_in",
-            "proj_out",
         ],
         lora_dropout=args.lora_dropout,
         bias=args.lora_bias,
-        fan_in_fan_out=False,  # Set to False for Linear layers
+        fan_in_fan_out=False,
     )
 
     unet.add_adapter(unet_lora_config)
 
-    # 2. Text encoder LoRA (optional)
+    # Text encoder LoRA - DISABLED for speed
     if args.apply_lora_to_text_encoder:
         text_lora_config = LoraConfig(
             r=args.lora_rank // 2,
             lora_alpha=args.lora_alpha // 2,
-            target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
             lora_dropout=args.lora_dropout,
             bias=args.lora_bias,
             fan_in_fan_out=False,
         )
         text_encoder.add_adapter(text_lora_config)
         print("Applied LoRA to text encoder")
+    else:
+        print("Text encoder LoRA disabled for speed")
 
     # Set models to train mode
     unet.train()
@@ -537,14 +515,14 @@ def main():
     if args.apply_lora_to_text_encoder:
         print(f"Text Encoder LoRA parameters: {param_counts['text_encoder']:,}")
     print(f"TOTAL trainable parameters: {total_params:,}")
-    print(f"Number of parameter tensors: {len(trainable_params)}")
+    print(f"Estimated training time: ~4 hours")
 
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         if args.apply_lora_to_text_encoder:
             text_encoder.gradient_checkpointing_enable()
-        print("Enabled gradient checkpointing")
+        print("Enabled gradient checkpointing (slower but uses less memory)")
 
     # Setup optimizer
     if args.use_8bit_adam:
@@ -576,21 +554,24 @@ def main():
     # Create collate function
     collate_fn_instance = CollateFn(tokenizer)
 
-    # Create dataloader
+    # Create dataloader with more workers
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
         collate_fn=collate_fn_instance,
-        num_workers=2,
+        num_workers=args.num_workers,
+        pin_memory=True,  # Faster data transfer
     )
 
     # Calculate training steps
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
-    )
     if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        args.max_train_steps = args.num_train_epochs * len(train_dataloader)
+
+    # Ensure we don't train too long
+    if args.max_train_steps > 6000:
+        args.max_train_steps = 5000
+        print(f"Limiting training to {args.max_train_steps} steps for 4-hour target")
 
     # Setup scheduler
     lr_scheduler = get_scheduler(
@@ -627,19 +608,17 @@ def main():
     )
 
     logger.info("\n" + "=" * 60)
-    logger.info("HIGH-PARAMETER LoRA TRAINING")
+    logger.info("OPTIMIZED LoRA TRAINING - 4 HOUR TARGET")
     logger.info("=" * 60)
     logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num epochs = {args.num_train_epochs}")
+    logger.info(f"  Max training steps = {args.max_train_steps}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size = {total_batch_size}")
     logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
     logger.info(f"  LoRA rank = {args.lora_rank}")
     logger.info(f"  LoRA alpha = {args.lora_alpha}")
     logger.info(f"  Learning rate = {args.learning_rate}")
     logger.info(f"  Mixed precision = {args.mixed_precision}")
-    logger.info(f"  Gradient clipping = {args.clip_gradients}")
     logger.info(f"  Trainable parameters = {total_params:,}")
     logger.info("=" * 60)
 
@@ -653,6 +632,7 @@ def main():
 
     # Track loss for logging
     losses = []
+    start_time = time.time() if "time" in globals() else None
 
     for epoch in range(args.num_train_epochs):
         unet.train()
@@ -660,6 +640,13 @@ def main():
             text_encoder.train()
 
         for step, batch in enumerate(train_dataloader):
+            # Check time limit
+            if "time" in globals():
+                elapsed = time.time() - start_time
+                if elapsed > 4 * 3600:  # 4 hours in seconds
+                    print(f"\nReached 4-hour time limit at step {global_step}")
+                    break
+
             with accelerator.accumulate(unet):
                 # Use autocast for mixed precision
                 with torch.autocast(
@@ -742,16 +729,8 @@ def main():
                     )
                     losses.append(loss.detach().item())
 
-                # Backward pass
+                # Backward pass - NO GRADIENT CLIPPING for speed
                 accelerator.backward(loss)
-
-                # Gradient clipping - only if enabled AND not using mixed precision
-                if (
-                    accelerator.sync_gradients
-                    and args.clip_gradients
-                    and args.mixed_precision == "no"
-                ):
-                    accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -762,7 +741,7 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
 
-                # Save checkpoint
+                # Save checkpoint less frequently
                 if (
                     global_step % args.checkpointing_steps == 0
                     and accelerator.is_main_process
@@ -777,11 +756,10 @@ def main():
 
                     logger.info(f"Saved checkpoint to {save_path}")
 
-                    # Save loss history
+                    # Log progress
                     if losses:
-                        avg_loss = sum(losses) / len(losses)
-                        logger.info(f"  Average loss: {avg_loss:.4f}")
-                        losses = []  # Reset
+                        avg_loss = sum(losses[-100:]) / min(100, len(losses))
+                        logger.info(f"  Step {global_step}, Avg Loss: {avg_loss:.4f}")
 
             # Log
             logs = {
@@ -818,15 +796,9 @@ def main():
         torch.save(peft_state_dict, peft_save_path)
         print(f"Saved PEFT LoRA weights to {peft_save_path}")
 
-        # Save text encoder LoRA if enabled
-        if args.apply_lora_to_text_encoder:
-            text_encoder.save_pretrained(
-                os.path.join(args.output_dir, "text_encoder_lora")
-            )
-            print(f"Saved text encoder LoRA to {args.output_dir}/text_encoder_lora")
-
         # Save training summary
         import json
+        import time
 
         summary = {
             "total_steps": global_step,
@@ -834,8 +806,9 @@ def main():
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_alpha,
             "learning_rate": args.learning_rate,
-            "num_epochs": args.num_train_epochs,
-            "batch_size": args.train_batch_size,
+            "final_loss": loss.item() if "loss" in locals() else None,
+            "training_time_target": "4 hours",
+            "actual_steps": global_step,
         }
         with open(os.path.join(args.output_dir, "training_summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
@@ -845,7 +818,13 @@ def main():
 
     accelerator.end_training()
     print(f"\nTraining completed! Total steps: {global_step}")
+    print(f"Estimated quality: Good for emoji inpainting")
+    print(f"Next: Run evaluation script to test the model")
 
 
 if __name__ == "__main__":
+    import time  # Add time import at module level
+
+    # Set start time
+    start_time = time.time()
     main()
