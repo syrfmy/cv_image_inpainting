@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Stable Diffusion LoRA Training - FIXED VERSION
-Uses erased images + masks where black = damage area
+High-Parameter LoRA Training for Inpainting
+With maximum trainable parameters for better performance
 """
 
 import argparse
@@ -24,7 +24,7 @@ from diffusers.optimization import get_scheduler
 # PEFT imports
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
-from PIL import Image, ImageOps
+from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -34,17 +34,7 @@ logger = get_logger(__name__)
 
 
 def prepare_mask_and_masked_image(original_image, mask_image, erased_image=None):
-    """Prepare mask and masked image for inpainting training
-
-    Args:
-        original_image: PIL Image of original complete image (target)
-        mask_image: PIL Image mask where BLACK = damage area, WHITE = intact
-        erased_image: PIL Image with white/blank where damage was (input)
-
-    Returns:
-        mask: Tensor where 1 = inpaint (damage), 0 = keep (intact)
-        masked_image: Tensor of erased image (white where damage was)
-    """
+    """Prepare mask and masked image for inpainting training"""
     # Convert original image to tensor [-1, 1]
     orig_np = np.array(original_image.convert("RGB"))
     orig_np = orig_np[None].transpose(0, 3, 1, 2)
@@ -53,17 +43,10 @@ def prepare_mask_and_masked_image(original_image, mask_image, erased_image=None)
     # Convert mask: black (damage) -> 1 (inpaint), white (intact) -> 0 (keep)
     mask_np = np.array(mask_image.convert("L"))
     mask_np = mask_np.astype(np.float32) / 255.0
-
-    # INVERT: Since black=damage in your masks, we need white=1 for inpainting
-    # But actually, we want to keep the original mask values:
-    # black (0) -> damage -> should inpaint -> should be 1
-    # white (255) -> intact -> should keep -> should be 0
-    # So we need: mask = 1 - mask_np (or threshold differently)
-
     mask_np = 1.0 - mask_np  # Invert: now white=damage, black=intact
     mask_np = mask_np[None, None]
-    mask_np[mask_np < 0.5] = 0  # Make binary: values < 0.5 become 0
-    mask_np[mask_np >= 0.5] = 1  # Values >= 0.5 become 1
+    mask_np[mask_np < 0.5] = 0
+    mask_np[mask_np >= 0.5] = 1
     mask_tensor = torch.from_numpy(mask_np)
 
     # Use erased image directly as masked image
@@ -74,24 +57,21 @@ def prepare_mask_and_masked_image(original_image, mask_image, erased_image=None)
             torch.from_numpy(erased_np).to(dtype=torch.float32) / 127.5 - 1.0
         )
     else:
-        # Fallback: create masked image from original
-        masked_tensor = orig_tensor * (
-            1 - mask_tensor
-        )  # Keep intact areas, black out damage
+        masked_tensor = orig_tensor * (1 - mask_tensor)
 
     return mask_tensor, masked_tensor
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="LoRA Training for Inpainting using PEFT"
+        description="High-Parameter LoRA Training for Inpainting"
     )
 
     # Required arguments
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="runwayml/stable-diffusion-inpainting",  # Use inpainting model!
+        default="runwayml/stable-diffusion-inpainting",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -103,7 +83,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="lora-inpainting-model",
+        default="lora-high-param-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
 
@@ -117,11 +97,11 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=4,
+        default=2,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
-        "--num_train_epochs", type=int, default=10, help="Number of training epochs."
+        "--num_train_epochs", type=int, default=40, help="Number of training epochs."
     )
     parser.add_argument(
         "--max_train_steps",
@@ -132,19 +112,19 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=2,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-6,
+        default=3e-5,
         help="Initial learning rate.",
     )
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="constant",
+        default="cosine",
         help="The scheduler type to use.",
     )
     parser.add_argument(
@@ -181,47 +161,60 @@ def parse_args():
         "--max_grad_norm", default=1.0, type=float, help="Max gradient norm."
     )
     parser.add_argument(
-        "--seed", type=int, default=None, help="A seed for reproducible training."
+        "--seed", type=int, default=42, help="A seed for reproducible training."
     )
 
-    # LoRA parameters
+    # LoRA parameters (INCREASED)
     parser.add_argument(
         "--lora_rank",
         type=int,
-        default=4,
-        help="Rank of LoRA layers.",
+        default=128,
+        help="Rank of LoRA layers. Higher = more parameters.",
     )
     parser.add_argument(
         "--lora_alpha",
         type=int,
-        default=32,
+        default=256,
         help="Alpha parameter for LoRA scaling.",
     )
     parser.add_argument(
         "--lora_dropout",
         type=float,
-        default=0.0,
-        help="Dropout probability for LoRA layers.",
+        default=0.15,
+        help="Dropout probability for LoRA layers to prevent overfitting.",
     )
     parser.add_argument(
         "--lora_bias",
         type=str,
-        default="none",
+        default="lora_only",
         choices=["none", "all", "lora_only"],
         help="Bias type for LoRA. 'none': no bias, 'all': all bias, 'lora_only': only LoRA bias",
+    )
+    parser.add_argument(
+        "--apply_lora_to_text_encoder",
+        action="store_true",
+        default=True,
+        help="Apply LoRA to text encoder for more parameters.",
+    )
+    parser.add_argument(
+        "--apply_lora_to_vae",
+        action="store_true",
+        default=False,
+        help="Apply LoRA to VAE for even more parameters.",
     )
 
     # System parameters
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="no",
+        default="fp16",
         choices=["no", "fp16", "bf16"],
         help="Whether to use mixed precision.",
     )
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
+        default=True,
         help="Whether or not to use gradient checkpointing to save memory.",
     )
     parser.add_argument(
@@ -239,7 +232,21 @@ def parse_args():
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention",
         action="store_true",
+        default=True,
         help="Whether or not to use xformers.",
+    )
+    parser.add_argument(
+        "--validation_steps",
+        type=int,
+        default=1000,
+        help="Run validation every X steps.",
+    )
+    parser.add_argument(
+        "--validation_prompts",
+        type=str,
+        nargs="+",
+        default=["emoji 6", "emoji 100", "emoji 42"],
+        help="Prompts for validation during training.",
     )
 
     args = parser.parse_args()
@@ -254,7 +261,6 @@ class InpaintingDataset(Dataset):
     """
     Dataset for inpainting training with your folder structure.
     Expects: train_data_dir/erased/, train_data_dir/masks/, train_data_dir/orig/
-    Uses: erased images + masks (black=damage) as input, original images as target
     """
 
     def __init__(
@@ -396,10 +402,98 @@ class CollateFn:
 
         return {
             "input_ids": input_ids,
-            "target_images": target_tensors,  # Renamed for clarity
+            "target_images": target_tensors,
             "masks": masks,
             "masked_images": masked_images,
         }
+
+
+def create_extended_lora_config(args, model_type="unet"):
+    """Create LoRA configuration with maximum parameters"""
+
+    if model_type == "unet":
+        # Extended target modules for UNet
+        target_modules = [
+            # Attention layers
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "attn1.to_q",
+            "attn1.to_k",
+            "attn1.to_v",
+            "attn1.to_out.0",
+            "attn2.to_q",
+            "attn2.to_k",
+            "attn2.to_v",
+            "attn2.to_out.0",
+            # Feed-forward layers
+            "ff.net.0.proj",
+            "ff.net.2",
+            # Convolution layers
+            "conv1",
+            "conv2",
+            "conv_shortcut",
+            "conv_in",
+            "conv_out",
+            "conv_norm_out",
+            # Time embeddings
+            "time_emb_proj",
+            # Normalization layers
+            "norm1",
+            "norm2",
+            "norm3",
+            "group_norm",
+            "layer_norm",
+            # Resnet and transformer blocks
+            "resnet.*.conv1",
+            "resnet.*.conv2",
+            "transformer_blocks.*.attn1.to_q",
+            "transformer_blocks.*.attn1.to_k",
+            "transformer_blocks.*.attn1.to_v",
+            "transformer_blocks.*.attn1.to_out.0",
+            "transformer_blocks.*.attn2.to_q",
+            "transformer_blocks.*.attn2.to_k",
+            "transformer_blocks.*.attn2.to_v",
+            "transformer_blocks.*.attn2.to_out.0",
+            "transformer_blocks.*.ff.net.0.proj",
+            "transformer_blocks.*.ff.net.2",
+        ]
+        rank = args.lora_rank
+        alpha = args.lora_alpha
+
+    elif model_type == "text_encoder":
+        # For text encoder
+        target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+        rank = args.lora_rank // 2  # Smaller rank for text encoder
+        alpha = args.lora_alpha // 2
+
+    elif model_type == "vae":
+        # For VAE
+        target_modules = [
+            "conv_in",
+            "conv_out",
+            "conv_norm_out",
+            "mid_block.*",
+            "up_blocks.*.conv",
+            "down_blocks.*.conv",
+            "encoder.conv_in",
+            "encoder.conv_out",
+            "decoder.conv_in",
+            "decoder.conv_out",
+        ]
+        rank = args.lora_rank // 4  # Even smaller for VAE
+        alpha = args.lora_alpha // 4
+
+    return LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        target_modules=target_modules,
+        lora_dropout=args.lora_dropout,
+        bias=args.lora_bias,
+        fan_in_fan_out=True,
+        init_lora_weights="gaussian",
+    )
 
 
 def main():
@@ -426,7 +520,7 @@ def main():
         args.pretrained_model_name_or_path, subfolder="tokenizer"
     )
 
-    # Load models - USE INPAINTING MODEL!
+    # Load models
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder"
     )
@@ -437,7 +531,7 @@ def main():
         args.pretrained_model_name_or_path, subfolder="unet"
     )
 
-    # Freeze models - only train LoRA
+    # Freeze base models - only train LoRA
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
@@ -460,47 +554,81 @@ def main():
 
         if is_xformers_available():
             unet.enable_xformers_memory_efficient_attention()
+            print("Enabled xformers memory efficient attention")
         else:
-            raise ValueError("xformers is not available")
+            print("XFormers not available, using default attention")
 
-    # Setup LoRA using PEFT
-    # Create LoRA config
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-        lora_dropout=args.lora_dropout,
-        bias=args.lora_bias,
-    )
+    # Setup LoRA with maximum parameters
+    print(f"\nSetting up LoRA with rank={args.lora_rank}, alpha={args.lora_alpha}")
 
-    # Add LoRA adapter to UNet
-    unet.add_adapter(lora_config)
+    # 1. UNet LoRA (main model)
+    unet_lora_config = create_extended_lora_config(args, "unet")
+    unet.add_adapter(unet_lora_config)
 
-    # Now only LoRA parameters are trainable
+    # 2. Text encoder LoRA (optional, adds more parameters)
+    if args.apply_lora_to_text_encoder:
+        text_lora_config = create_extended_lora_config(args, "text_encoder")
+        text_encoder.add_adapter(text_lora_config)
+        print("Applied LoRA to text encoder")
+
+    # 3. VAE LoRA (optional, adds even more parameters)
+    if args.apply_lora_to_vae:
+        vae_lora_config = create_extended_lora_config(args, "vae")
+        vae.add_adapter(vae_lora_config)
+        print("Applied LoRA to VAE")
+
+    # Set models to train mode
     unet.train()
+    if args.apply_lora_to_text_encoder:
+        text_encoder.train()
+    if args.apply_lora_to_vae:
+        vae.train()
 
-    # Get trainable parameters
+    # Collect all trainable parameters
     trainable_params = []
-    for name, param in unet.named_parameters():
-        if "lora" in name.lower():
-            param.requires_grad = True
-            trainable_params.append(param)
-        else:
-            param.requires_grad = False
+    param_counts = {}
 
-    print(f"Number of trainable parameters: {len(trainable_params)}")
+    for model_name, model in [
+        ("unet", unet),
+        ("text_encoder", text_encoder),
+        ("vae", vae),
+    ]:
+        model_params = 0
+        for name, param in model.named_parameters():
+            if "lora" in name.lower():
+                param.requires_grad = True
+                trainable_params.append(param)
+                model_params += param.numel()
+            else:
+                param.requires_grad = False
+        param_counts[model_name] = model_params
+
+    total_params = sum(param_counts.values())
+
+    print(f"\n=== TRAINABLE PARAMETERS ===")
+    print(f"UNet LoRA parameters: {param_counts['unet']:,}")
+    if args.apply_lora_to_text_encoder:
+        print(f"Text Encoder LoRA parameters: {param_counts['text_encoder']:,}")
+    if args.apply_lora_to_vae:
+        print(f"VAE LoRA parameters: {param_counts['vae']:,}")
+    print(f"TOTAL trainable parameters: {total_params:,}")
+    print(f"Number of parameter tensors: {len(trainable_params)}")
 
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
+        if args.apply_lora_to_text_encoder:
+            text_encoder.gradient_checkpointing_enable()
+        print("Enabled gradient checkpointing")
 
     # Setup optimizer
     if args.use_8bit_adam:
         try:
             import bitsandbytes as bnb
+
+            optimizer_class = bnb.optim.AdamW8bit
         except ImportError:
             raise ImportError("Please install bitsandbytes: pip install bitsandbytes")
-        optimizer_class = bnb.optim.AdamW8bit
     else:
         optimizer_class = torch.optim.AdamW
 
@@ -548,6 +676,17 @@ def main():
     )
 
     # Prepare with accelerator
+    if args.apply_lora_to_text_encoder and args.apply_lora_to_vae:
+        models = [unet, text_encoder, vae]
+    elif args.apply_lora_to_text_encoder:
+        models = [unet, text_encoder]
+    else:
+        models = [unet]
+
+    models.append(optimizer)
+    models.append(train_dataloader)
+    models.append(lr_scheduler)
+
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, train_dataloader, lr_scheduler
     )
@@ -564,7 +703,9 @@ def main():
         * args.gradient_accumulation_steps
     )
 
-    logger.info("***** Running training *****")
+    logger.info("\n" + "=" * 60)
+    logger.info("HIGH-PARAMETER LoRA TRAINING")
+    logger.info("=" * 60)
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
@@ -573,6 +714,9 @@ def main():
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     logger.info(f"  LoRA rank = {args.lora_rank}")
     logger.info(f"  LoRA alpha = {args.lora_alpha}")
+    logger.info(f"  Learning rate = {args.learning_rate}")
+    logger.info(f"  Trainable parameters = {total_params:,}")
+    logger.info("=" * 60)
 
     # Training loop
     global_step = 0
@@ -582,11 +726,15 @@ def main():
     )
     progress_bar.set_description("Steps")
 
-    # Debug: Check what we're feeding to the model (first batch only)
-    debug_printed = False
+    # Track loss for logging
+    losses = []
 
     for epoch in range(args.num_train_epochs):
         unet.train()
+        if args.apply_lora_to_text_encoder:
+            text_encoder.train()
+        if args.apply_lora_to_vae:
+            vae.train()
 
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
@@ -616,29 +764,6 @@ def main():
                 ).to(dtype=weight_dtype)
                 mask = mask.reshape(-1, 1, args.resolution // 8, args.resolution // 8)
 
-                # Debug output for first batch
-                if (
-                    not debug_printed
-                    and accelerator.is_local_main_process
-                    and step == 0
-                ):
-                    print("\n=== DEBUG INFORMATION (First Batch) ===")
-                    print(f"Mask statistics:")
-                    print(
-                        f"  Min: {mask.min().item():.3f}, Max: {mask.max().item():.3f}"
-                    )
-                    print(f"  Mean: {mask.mean().item():.3f}")
-                    print(
-                        f"  Values < 0.5: {(mask < 0.5).sum().item() / mask.numel() * 100:.1f}%"
-                    )
-                    print(
-                        f"  Values >= 0.5: {(mask >= 0.5).sum().item() / mask.numel() * 100:.1f}%"
-                    )
-                    print(
-                        f"Latent shapes: {latents.shape}, Mask: {mask.shape}, Masked: {masked_latents.shape}"
-                    )
-                    debug_printed = True
-
                 # Sample noise
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
@@ -654,7 +779,7 @@ def main():
                 # Add noise to latents
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Concatenate for inpainting: [noisy_latents, mask, masked_latents]
+                # Concatenate for inpainting
                 latent_model_input = torch.cat(
                     [noisy_latents, mask, masked_latents], dim=1
                 )
@@ -677,14 +802,16 @@ def main():
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
 
-                # Optionally: Apply mask to loss to focus on damaged areas
+                # Option 1: Standard MSE loss
+                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+
+                # Option 2: Mask-weighted loss (uncomment to use)
                 # mask_flat = mask.flatten(1)
                 # loss_per_pixel = F.mse_loss(noise_pred.float(), target.float(), reduction='none')
-                # loss_per_pixel = loss_per_pixel.flatten(1)
+                # loss_per_pixel = loss_per_pixel.mean(dim=1).flatten(1)
                 # loss = (loss_per_pixel * mask_flat).sum() / mask_flat.sum().clamp(min=1)
 
-                # Or use standard loss
-                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                losses.append(loss.detach().item())
 
                 # Backward pass
                 accelerator.backward(loss)
@@ -701,6 +828,11 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
 
+                # Log average loss
+                if len(losses) > 0:
+                    avg_loss = sum(losses) / len(losses)
+                    losses = []  # Reset
+
                 # Save checkpoint
                 if (
                     global_step % args.checkpointing_steps == 0
@@ -712,8 +844,25 @@ def main():
                     accelerator.save_state(save_path)
                     logger.info(f"Saved checkpoint to {save_path}")
 
+                    # Save LoRA weights separately
+                    unet.save_attn_procs(os.path.join(save_path, "lora_weights"))
+
+                    # Save PEFT state dict
+                    if accelerator.is_main_process:
+                        peft_state_dict = get_peft_model_state_dict(unet)
+                        torch.save(
+                            peft_state_dict,
+                            os.path.join(save_path, "peft_lora_weights.safetensors"),
+                        )
+
             # Log
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "loss": loss.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+                "step": global_step,
+            }
+            if len(losses) > 10:
+                logs["avg_loss"] = sum(losses[-10:]) / 10
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -724,26 +873,47 @@ def main():
 
     # Save final model
     if accelerator.is_main_process:
+        print("\n" + "=" * 60)
+        print("SAVING FINAL MODEL")
+        print("=" * 60)
+
         # Save LoRA weights
         unet = unet.to(torch.float32)
 
-        # Save using PEFT's method
-        from peft import set_peft_model_state_dict
-
-        # Get the state dict
-        peft_state_dict = get_peft_model_state_dict(unet)
-
-        # Save LoRA weights
-        lora_save_path = os.path.join(args.output_dir, "lora_weights.safetensors")
-        torch.save(peft_state_dict, lora_save_path)
-
-        # Also save in the diffusers format for compatibility
+        # Save in diffusers format
         unet.save_attn_procs(args.output_dir)
+        print(f"Saved LoRA weights to {args.output_dir}")
 
-        logger.info(f"Saved LoRA weights to {args.output_dir}")
-        logger.info(f"Saved PEFT LoRA weights to {lora_save_path}")
+        # Save PEFT state dict
+        peft_state_dict = get_peft_model_state_dict(unet)
+        peft_save_path = os.path.join(args.output_dir, "peft_lora_weights.safetensors")
+        torch.save(peft_state_dict, peft_save_path)
+        print(f"Saved PEFT LoRA weights to {peft_save_path}")
+
+        # Save text encoder LoRA if enabled
+        if args.apply_lora_to_text_encoder:
+            text_encoder.save_pretrained(
+                os.path.join(args.output_dir, "text_encoder_lora")
+            )
+            print(f"Saved text encoder LoRA to {args.output_dir}/text_encoder_lora")
+
+        # Save training config
+        import json
+
+        config = {
+            "args": vars(args),
+            "total_trainable_parameters": total_params,
+            "training_steps": global_step,
+            "final_loss": loss.item() if "loss" in locals() else None,
+        }
+        with open(os.path.join(args.output_dir, "training_config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        print(f"Saved training config to {args.output_dir}/training_config.json")
+        print("=" * 60)
 
     accelerator.end_training()
+    print(f"\nTraining completed! Total steps: {global_step}")
 
 
 if __name__ == "__main__":
