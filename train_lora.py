@@ -220,15 +220,12 @@ def setup_models_correct(args):
     # Enable LoRA using diffusers built-in method
     print(f"Setting up LoRA with rank={args.lora_rank}...")
 
-    from diffusers.models.attention_processor import (
-        LoRAAttnProcessor,
-        LoRAAttnProcessor2_0,
-    )
+    from diffusers.models.attention_processor import LoRAAttnProcessor
 
     # Set attention processors to LoRA
     lora_attn_procs = {}
 
-    for name, attn_processor in unet.attn_processors.items():
+    for name in unet.attn_processors.keys():
         cross_attention_dim = (
             None
             if name.endswith("attn1.processor")
@@ -250,18 +247,12 @@ def setup_models_correct(args):
         if hidden_size is None:
             continue
 
-        # Choose processor - FIXED
-        if hasattr(F, "scaled_dot_product_attention"):
-            lora_attn_procs[name] = LoRAAttnProcessor2_0(
-                cross_attention_dim=cross_attention_dim,
-                rank=args.lora_rank,
-            )
-        else:
-            lora_attn_procs[name] = LoRAAttnProcessor(
-                hidden_size=hidden_size,
-                cross_attention_dim=cross_attention_dim,
-                rank=args.lora_rank,
-            )
+        # Use LoRAAttnProcessor for compatibility
+        lora_attn_procs[name] = LoRAAttnProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=args.lora_rank,
+        )
 
     # Set the processors
     unet.set_attn_processor(lora_attn_procs)
@@ -472,23 +463,21 @@ def setup_models_64x64(args):
     unet.to(args.device)
 
     # Enable LoRA
-    print(f"Setting up LoRA for 64x64 training...")
+    print(f"Setting up LoRA with rank={args.lora_rank}...")
 
-    from diffusers.models.attention_processor import (
-        LoRAAttnProcessor,
-        LoRAAttnProcessor2_0,
-    )
+    from diffusers.models.attention_processor import LoRAAttnProcessor
 
+    # Set attention processors to LoRA
     lora_attn_procs = {}
 
-    for name, attn_processor in unet.attn_processors.items():
+    for name in unet.attn_processors.keys():
         cross_attention_dim = (
             None
             if name.endswith("attn1.processor")
             else unet.config.cross_attention_dim
         )
 
-        # Get hidden size
+        # Get hidden size based on block
         if name.startswith("mid_block"):
             hidden_size = unet.config.block_out_channels[-1]
         elif name.startswith("up_blocks"):
@@ -503,25 +492,20 @@ def setup_models_64x64(args):
         if hidden_size is None:
             continue
 
-        # Choose processor - FIXED: LoRAAttnProcessor2_0 doesn't take hidden_size parameter
-        if hasattr(F, "scaled_dot_product_attention"):
-            lora_attn_procs[name] = LoRAAttnProcessor2_0(
-                cross_attention_dim=cross_attention_dim,
-                rank=args.lora_rank,
-            )
-        else:
-            lora_attn_procs[name] = LoRAAttnProcessor(
-                hidden_size=hidden_size,
-                cross_attention_dim=cross_attention_dim,
-                rank=args.lora_rank,
-            )
+        # Use LoRAAttnProcessor (compatible with all PyTorch versions)
+        lora_attn_procs[name] = LoRAAttnProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=args.lora_rank,
+        )
 
+    # Set the processors
     unet.set_attn_processor(lora_attn_procs)
 
     # Freeze UNet, only train LoRA
     unet.requires_grad_(False)
 
-    # Collect trainable parameters
+    # Collect trainable parameters (only LoRA)
     trainable_params = []
     for name, param in unet.named_parameters():
         if "lora" in name:
