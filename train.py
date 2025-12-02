@@ -633,7 +633,6 @@ def main():
 
     # Track loss for logging
     losses = []
-    start_time = time.time() if "time" in globals() else None
 
     for epoch in range(args.num_train_epochs):
         unet.train()
@@ -642,11 +641,6 @@ def main():
 
         for step, batch in enumerate(train_dataloader):
             # Check time limit
-            if "time" in globals():
-                elapsed = time.time() - start_time
-                if elapsed > 4 * 3600:  # 4 hours in seconds
-                    print(f"\nReached 4-hour time limit at step {global_step}")
-                    break
 
             with accelerator.accumulate(unet):
                 # Use autocast for mixed precision
@@ -824,8 +818,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import time  # Add time import at module level
-
-    # Set start time
-    start_time = time.time()
     main()
