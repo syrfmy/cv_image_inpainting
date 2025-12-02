@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stable Diffusion LoRA Training Script - FIXED VERSION
+Stable Diffusion LoRA Training - Clean Version using Diffusers built-in LoRA
 """
 
 import argparse
@@ -10,7 +10,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 # Import from diffusers
@@ -26,87 +25,7 @@ from tqdm import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 # ============================================================================
-# SIMPLIFIED LoRA IMPLEMENTATION
-# ============================================================================
-
-
-class LoRALayer(nn.Module):
-    def __init__(self, in_features, out_features, rank=4, alpha=1.0):
-        super().__init__()
-        self.rank = rank
-        self.alpha = alpha
-
-        # Down projection
-        self.lora_down = nn.Linear(in_features, rank, bias=False)
-        # Up projection
-        self.lora_up = nn.Linear(rank, out_features, bias=False)
-
-        # Initialize
-        nn.init.normal_(self.lora_down.weight, std=1 / rank)
-        nn.init.zeros_(self.lora_up.weight)
-
-    def forward(self, x):
-        return self.lora_up(self.lora_down(x)) * (self.alpha / self.rank)
-
-
-def inject_lora_simple(unet, rank=4):
-    """Simplified LoRA injection that works with diffusers"""
-    from diffusers.models.attention_processor import (
-        LoRAAttnProcessor,
-        LoRAAttnProcessor2_0,
-    )
-
-    # Create LoRA attention processors
-    lora_attn_procs = {}
-
-    for name in unet.attn_processors.keys():
-        cross_attention_dim = (
-            None
-            if name.endswith("attn1.processor")
-            else unet.config.cross_attention_dim
-        )
-
-        # Get hidden size based on block
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = unet.config.block_out_channels[block_id]
-
-        # Use appropriate processor version
-        if hasattr(F, "scaled_dot_product_attention"):
-            attn_processor_class = LoRAAttnProcessor2_0
-        else:
-            attn_processor_class = LoRAAttnProcessor
-
-        lora_attn_procs[name] = attn_processor_class(
-            hidden_size=hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=rank,
-        )
-
-    # Set attention processors
-    unet.set_attn_processor(lora_attn_procs)
-
-    # Collect trainable parameters
-    trainable_params = []
-    for name, param in unet.named_parameters():
-        if "lora" in name:
-            param.requires_grad = True
-            trainable_params.append(param)
-        else:
-            param.requires_grad = False
-
-    print(f"Trainable LoRA parameters: {sum(p.numel() for p in trainable_params):,}")
-
-    return trainable_params
-
-
-# ============================================================================
-# DATASET (same as before)
+# DATASET - NO CHANGES
 # ============================================================================
 
 
@@ -268,56 +187,116 @@ class StableDiffusionDataset(Dataset):
 
 
 # ============================================================================
-# SETUP MODELS (SIMPLIFIED)
+# SETUP MODELS - USING DIFFUSERS BUILT-IN LoRA
 # ============================================================================
 
 
-def setup_models(args):
-    """Load pre-trained models with LoRA"""
-    print("Loading models...")
+def setup_models_diffusers_lora(args):
+    """Setup using diffusers' built-in LoRA support"""
+    print("Setting up models with diffusers built-in LoRA...")
 
-    # Load tokenizer
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_name, subfolder="tokenizer")
-
-    # Load text encoder
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.model_name, subfolder="text_encoder"
+    # Create pipeline
+    pipe = StableDiffusionPipeline.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.float16 if args.device == "cuda" else torch.float32,
     )
-    text_encoder.to(args.device)
-    text_encoder.requires_grad_(False)  # Freeze text encoder
 
-    # Load VAE
-    vae = AutoencoderKL.from_pretrained(args.model_name, subfolder="vae")
-    vae.to(args.device)
-    vae.requires_grad_(False)  # Freeze VAE
+    # Freeze all components
+    pipe.text_encoder.requires_grad_(False)
+    pipe.vae.requires_grad_(False)
 
-    # Load UNet
-    unet = UNet2DConditionModel.from_pretrained(args.model_name, subfolder="unet")
-    unet.to(args.device)
+    # Enable LoRA for UNet
+    print(f"Enabling LoRA with rank={args.lora_rank}...")
+    pipe.unet.load_attn_procs(
+        args.pretrained_lora_path
+        if hasattr(args, "pretrained_lora_path") and args.pretrained_lora_path
+        else None,
+        adapter_name="default",
+    )
 
-    # Inject LoRA using diffusers' built-in method
-    print(f"Injecting LoRA with rank={args.lora_rank}...")
-    lora_params = inject_lora_simple(unet, rank=args.lora_rank)
+    # If no pretrained LoRA, we need to inject it
+    if not hasattr(args, "pretrained_lora_path") or not args.pretrained_lora_path:
+        from diffusers.models.attention_processor import (
+            LoRAAttnProcessor,
+            LoRAAttnProcessor2_0,
+        )
+
+        # Set attention processor to LoRA
+        lora_attn_procs = {}
+        for name in pipe.unet.attn_processors.keys():
+            cross_attention_dim = (
+                None
+                if name.endswith("attn1.processor")
+                else pipe.unet.config.cross_attention_dim
+            )
+
+            # Get hidden size based on block
+            if name.startswith("mid_block"):
+                hidden_size = pipe.unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(pipe.unet.config.block_out_channels))[
+                    block_id
+                ]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = pipe.unet.config.block_out_channels[block_id]
+
+            # Use appropriate processor
+            if hasattr(F, "scaled_dot_product_attention"):
+                attn_processor_class = LoRAAttnProcessor2_0
+            else:
+                attn_processor_class = LoRAAttnProcessor
+
+            lora_attn_procs[name] = attn_processor_class(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                rank=args.lora_rank,
+            )
+
+        pipe.unet.set_attn_processor(lora_attn_procs)
+
+    # Move to device
+    pipe = pipe.to(args.device)
+
+    # Extract components
+    unet = pipe.unet
+    vae = pipe.vae
+    text_encoder = pipe.text_encoder
+    tokenizer = pipe.tokenizer
+
+    # Get trainable parameters (only LoRA)
+    trainable_params = []
+    for name, param in unet.named_parameters():
+        if "lora" in name:
+            param.requires_grad = True
+            trainable_params.append(param)
+        else:
+            param.requires_grad = False
+
+    print(f"Trainable parameters: {len(trainable_params)}")
+    print(f"Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
     # Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.model_name, subfolder="scheduler"
     )
 
-    return tokenizer, text_encoder, vae, unet, noise_scheduler, lora_params
+    return tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params
 
 
 # ============================================================================
-# TRAINING FUNCTION
+# SIMPLE TRAINING - NO COMPLEXITY
 # ============================================================================
 
 
-def train(args):
-    """Main training function"""
+def train_simple(args):
+    """Simple training without complex LoRA logic"""
+    print("Starting simple training...")
 
     # Setup models
-    tokenizer, text_encoder, vae, unet, noise_scheduler, lora_params = setup_models(
-        args
+    tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params = (
+        setup_models_diffusers_lora(args)
     )
 
     # Training dataset
@@ -328,32 +307,16 @@ def train(args):
         is_test=False,
     )
 
-    # Evaluation dataset
-    if args.eval_data:
-        eval_dataset = StableDiffusionDataset(
-            data_path=args.eval_data,
-            tokenizer=tokenizer,
-            resolution=args.resolution,
-            is_test=True,
-        )
-        eval_dataloader = DataLoader(
-            eval_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-        )
-    else:
-        eval_dataloader = None
-
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        pin_memory=True,
     )
 
     # Optimizer
-    optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
 
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -368,8 +331,188 @@ def train(args):
         for batch_idx, batch in enumerate(progress_bar):
             # Move to device
             original = batch["original"].to(args.device)
-            erased = batch["erased"].to(args.device)
-            mask = batch["mask"].to(args.device)
+            input_ids = batch["input_ids"].to(args.device)
+
+            # Encode images to latent space
+            with torch.no_grad():
+                # Convert to right dtype
+                if args.device == "cuda":
+                    original = original.half()
+
+                latents_original = vae.encode(original).latent_dist.sample() * 0.18215
+
+                # Get text embeddings
+                if args.use_text_conditioning:
+                    encoder_hidden_states = text_encoder(input_ids)[0]
+                else:
+                    encoder_hidden_states = None
+
+            # Sample noise
+            noise = torch.randn_like(latents_original)
+
+            # Sample timestep
+            timesteps = torch.randint(
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (latents_original.shape[0],),
+                device=args.device,
+            ).long()
+
+            # Add noise to latents
+            noisy_latents = noise_scheduler.add_noise(
+                latents_original, noise, timesteps
+            )
+
+            # Predict noise - SIMPLE CALL
+            noise_pred = unet(
+                noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states
+            ).sample
+
+            # Calculate loss
+            loss = F.mse_loss(noise_pred, noise)
+
+            # Backprop
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Update metrics
+            epoch_loss += loss.item()
+
+            progress_bar.set_postfix({"loss": loss.item()})
+
+        avg_loss = epoch_loss / len(train_dataloader)
+        print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}")
+
+        # Save checkpoint
+        if (epoch + 1) % args.save_every_n_epochs == 0:
+            checkpoint_path = os.path.join(
+                args.checkpoint_dir, f"lora_epoch_{epoch + 1}.safetensors"
+            )
+
+            # Save LoRA weights
+            unet.save_attn_procs(
+                args.checkpoint_dir, weight_name=f"lora_epoch_{epoch + 1}.safetensors"
+            )
+            print(f"Checkpoint saved to {checkpoint_path}")
+
+    print("Training completed!")
+
+    # Save final model
+    final_path = os.path.join(args.checkpoint_dir, "lora_final.safetensors")
+    unet.save_attn_procs(args.checkpoint_dir, weight_name="lora_final.safetensors")
+    print(f"Final LoRA weights saved to {final_path}")
+
+    return unet
+
+
+# ============================================================================
+# ALTERNATIVE: USE PEFT LIBRARY (MOST RELIABLE)
+# ============================================================================
+
+
+def setup_peft_lora(args):
+    """Setup using PEFT library - most reliable"""
+    try:
+        from peft import LoraConfig, get_peft_model
+
+        print("Setting up PEFT LoRA...")
+
+        # Load models
+        tokenizer = CLIPTokenizer.from_pretrained(
+            args.model_name, subfolder="tokenizer"
+        )
+        text_encoder = CLIPTextModel.from_pretrained(
+            args.model_name, subfolder="text_encoder"
+        )
+        vae = AutoencoderKL.from_pretrained(args.model_name, subfolder="vae")
+        unet = UNet2DConditionModel.from_pretrained(args.model_name, subfolder="unet")
+
+        # Move to device
+        text_encoder = text_encoder.to(args.device)
+        vae = vae.to(args.device)
+        unet = unet.to(args.device)
+
+        # Freeze models
+        text_encoder.requires_grad_(False)
+        vae.requires_grad_(False)
+
+        # Configure LoRA
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_rank,
+            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+            lora_dropout=0.0,
+            bias="none",
+        )
+
+        # Convert UNet to PEFT model
+        unet = get_peft_model(unet, lora_config)
+
+        # Print trainable parameters
+        unet.print_trainable_parameters()
+
+        # Get trainable parameters
+        trainable_params = []
+        for name, param in unet.named_parameters():
+            if param.requires_grad:
+                trainable_params.append(param)
+
+        # Noise scheduler
+        noise_scheduler = DDPMScheduler.from_pretrained(
+            args.model_name, subfolder="scheduler"
+        )
+
+        return tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params
+
+    except ImportError:
+        print("PEFT library not found. Please install: pip install peft")
+        return None
+
+
+def train_with_peft(args):
+    """Train with PEFT library"""
+    print("Training with PEFT LoRA...")
+
+    # Setup with PEFT
+    result = setup_peft_lora(args)
+    if result is None:
+        print("Falling back to simple training...")
+        return train_simple(args)
+
+    tokenizer, text_encoder, vae, unet, noise_scheduler, trainable_params = result
+
+    # Training dataset
+    train_dataset = StableDiffusionDataset(
+        data_path=args.train_data,
+        tokenizer=tokenizer,
+        resolution=args.resolution,
+        is_test=False,
+    )
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+
+    # Create checkpoint directory
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    # Training loop
+    unet.train()
+
+    for epoch in range(args.epochs):
+        epoch_loss = 0
+        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+
+        for batch_idx, batch in enumerate(progress_bar):
+            # Move to device
+            original = batch["original"].to(args.device)
             input_ids = batch["input_ids"].to(args.device)
 
             # Encode images to latent space
@@ -409,7 +552,6 @@ def train(args):
             # Backprop
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
             optimizer.step()
 
             # Update metrics
@@ -426,25 +568,18 @@ def train(args):
                 args.checkpoint_dir, f"lora_epoch_{epoch + 1}.pt"
             )
 
-            # Save LoRA state
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": unet.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": avg_loss,
-                    "args": vars(args),
-                },
-                checkpoint_path,
-            )
+            # Save state dict
+            torch.save(unet.state_dict(), checkpoint_path)
             print(f"Checkpoint saved to {checkpoint_path}")
 
     print("Training completed!")
 
     # Save final model
     final_path = os.path.join(args.checkpoint_dir, "lora_final.pt")
-    torch.save({"model_state_dict": unet.state_dict(), "args": vars(args)}, final_path)
+    torch.save(unet.state_dict(), final_path)
     print(f"Final model saved to {final_path}")
+
+    return unet
 
 
 # ============================================================================
@@ -459,12 +594,6 @@ def main():
     parser.add_argument(
         "--train_data", type=str, required=True, help="Path to training dataset"
     )
-    parser.add_argument(
-        "--eval_data",
-        type=str,
-        default=None,
-        help="Path to evaluation dataset (optional)",
-    )
 
     # Model settings
     parser.add_argument(
@@ -478,6 +607,11 @@ def main():
     )
     parser.add_argument(
         "--use_text_conditioning", action="store_true", help="Use text conditioning"
+    )
+    parser.add_argument(
+        "--use_peft",
+        action="store_true",
+        help="Use PEFT library for LoRA (recommended)",
     )
 
     # Training hyperparameters
@@ -498,7 +632,7 @@ def main():
     parser.add_argument(
         "--save_every_n_epochs",
         type=int,
-        default=10,
+        default=5,
         help="Save checkpoint every N epochs",
     )
 
@@ -519,16 +653,22 @@ def main():
     if args.device is None:
         if not args.no_cuda and torch.cuda.is_available():
             args.device = "cuda"
+            print("Using CUDA")
         else:
             args.device = "cpu"
+            print("Using CPU")
 
-    print(f"Using device: {args.device}")
     print(f"Configuration:")
     for key, value in vars(args).items():
         print(f"  {key}: {value}")
 
-    # Run training
-    train(args)
+    # Choose training method
+    if args.use_peft:
+        print("\nUsing PEFT LoRA training...")
+        train_with_peft(args)
+    else:
+        print("\nUsing diffusers built-in LoRA training...")
+        train_simple(args)
 
 
 if __name__ == "__main__":
