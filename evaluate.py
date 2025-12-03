@@ -113,13 +113,9 @@ def evaluate_all_samples(args):
     test_data_path = Path(args.test_data_dir)
     erased_dir = test_data_path / "erased"
     masks_dir = test_data_path / "masks"
-    # orig_dir = test_data_path / "orig"
+    orig_dir = test_data_path / "orig"
 
-    # if not all([erased_dir.exists(), masks_dir.exists(), orig_dir.exists()]):
-    #     print("Missing directories")
-    #     return
-
-    if not all([erased_dir.exists(), masks_dir.exists()]):
+    if not all([erased_dir.exists(), masks_dir.exists(), orig_dir.exists()]):
         print("Missing directories")
         return
 
@@ -160,9 +156,9 @@ def evaluate_all_samples(args):
 
         # Find mask and original
         mask_file = masks_dir / f"{base_name}_mask.png"
-        # orig_file = orig_dir / f"{base_name}.png"
+        orig_file = orig_dir / f"{base_name}.png"
 
-        if not mask_file.exists():
+        if not mask_file.exists() or not orig_file.exists():
             failed_samples.append({"filename": filename, "reason": "Missing files"})
             continue
 
@@ -170,7 +166,7 @@ def evaluate_all_samples(args):
             # Load images
             erased_img = Image.open(test_file).convert("RGB")
             mask_img = Image.open(mask_file).convert("L")
-            # orig_img = Image.open(orig_file).convert("RGB")
+            orig_img = Image.open(orig_file).convert("RGB")
         except Exception as e:
             failed_samples.append({"filename": filename, "reason": f"Load error: {e}"})
             continue
@@ -178,7 +174,7 @@ def evaluate_all_samples(args):
         # Resize to 64x64
         erased_img = erased_img.resize(TARGET_SIZE, Image.LANCZOS)
         mask_img = mask_img.resize(TARGET_SIZE, Image.NEAREST)
-        # orig_img_resized = orig_img.resize(TARGET_SIZE, Image.LANCZOS)
+        orig_img_resized = orig_img.resize(TARGET_SIZE, Image.LANCZOS)
 
         # Invert mask
         mask_array = np.array(mask_img)
@@ -207,12 +203,12 @@ def evaluate_all_samples(args):
         if generated_img.size != TARGET_SIZE:
             generated_img = generated_img.resize(TARGET_SIZE, Image.LANCZOS)
 
-        # # Calculate metrics
-        # metrics = calculate_metrics(generated_img, orig_img_resized)
+        # Calculate metrics
+        metrics = calculate_metrics(generated_img, orig_img_resized)
 
         # Create clean composite (no text)
         composite = create_clean_composite(
-            erased_img, mask_img, generated_img, TARGET_SIZE
+            erased_img, mask_img, orig_img_resized, generated_img, TARGET_SIZE
         )
 
         # Save composite
@@ -224,15 +220,15 @@ def evaluate_all_samples(args):
             generated_img.save(individual_dir / f"{filename}_generated.png")
 
         # Store result
-        # all_results.append(
-        #     {
-        #         "filename": filename,
-        #         "psnr": float(metrics["psnr"]),
-        #         "l1": float(metrics["l1"]),
-        #         "l2": float(metrics["l2"]),
-        #         "composite_path": str(composite_path),
-        #     }
-        # )
+        all_results.append(
+            {
+                "filename": filename,
+                "psnr": float(metrics["psnr"]),
+                "l1": float(metrics["l1"]),
+                "l2": float(metrics["l2"]),
+                "composite_path": str(composite_path),
+            }
+        )
 
     # Generate summary
     if all_results:
