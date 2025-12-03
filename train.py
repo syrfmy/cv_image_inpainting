@@ -213,9 +213,9 @@ def parse_args():
     if args.train_data_dir is None:
         raise ValueError("You must specify a train data directory.")
 
-    # Env settings for better performance
-    os.environ["TORCH_CUDNN_V8_API_ENABLED"] = "1"
-    os.environ["ACCELERATE_DEBUG_MODE"] = "false"
+    # Suppress TensorFlow warnings (optional)
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     return args
 
@@ -234,9 +234,12 @@ class EmojiInpaintingDataset(Dataset):
         self.orig_dir = self.data_root / "orig"
 
         # Verify folders
-        assert self.erased_dir.exists(), f"erased folder not found: {self.erased_dir}"
-        assert self.masks_dir.exists(), f"masks folder not found: {self.masks_dir}"
-        assert self.orig_dir.exists(), f"orig folder not found: {self.orig_dir}"
+        if not self.erased_dir.exists():
+            raise ValueError(f"erased folder not found: {self.erased_dir}")
+        if not self.masks_dir.exists():
+            raise ValueError(f"masks folder not found: {self.masks_dir}")
+        if not self.orig_dir.exists():
+            raise ValueError(f"orig folder not found: {self.orig_dir}")
 
         # Get all files with flexible naming
         self.erased_files = self._collect_files(
@@ -406,23 +409,15 @@ def setup_lora_for_inpainting(unet, text_encoder=None, args=None):
         "add_v_proj",  # Cross-attention
         "proj_in",
         "proj_out",  # Additional projections
-        # Convolutional layers (critical for inpainting)
-        "conv_in",
-        "conv_out",
-        "conv_shortcut",
     ]
 
-    # Add more conv layers if requested
+    # Add conv layers if requested
     if args.train_conv_layers:
         unet_target_modules.extend(
             [
-                "*.conv",
-                "*.conv1",
-                "*.conv2",
-                "*.conv_shortcut",
-                "*resnets*.conv*",
-                "*upsamplers*.conv*",
-                "*downsamplers*.conv*",
+                "conv_in",
+                "conv_out",
+                "conv_shortcut",
             ]
         )
 
@@ -456,13 +451,18 @@ def setup_lora_for_inpainting(unet, text_encoder=None, args=None):
 def main():
     args = parse_args()
 
-    # Setup accelerator
+    # Setup accelerator with correct ProjectConfiguration
+    project_config = ProjectConfiguration(
+        project_dir=args.output_dir,
+        automatic_checkpoint_naming=True,
+        total_limit=5,  # Keep only last 5 checkpoints
+    )
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with="tensorboard",
-        project_dir=args.output_dir,
-        kwargs_handlers=[ProjectConfiguration(automatic_checkpoint_naming=True)],
+        project_config=project_config,  # CORRECT: pass as project_config
     )
 
     # Set seed
