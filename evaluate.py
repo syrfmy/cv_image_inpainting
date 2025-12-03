@@ -179,7 +179,7 @@ def load_test_samples_with_masks(
 
         # Get emoji ID for prompt
         emoji_id = base_name.split("__")[0]
-        prompt = f"emoji {emoji_id}"
+        prompt = f"a damaged picture of a single emoji that needs to be repaired"
 
         # Load ORIGINAL image (this is the input for inpainting)
         original_image = Image.open(orig_path).convert("RGB")
