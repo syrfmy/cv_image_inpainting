@@ -1,100 +1,436 @@
 #!/usr/bin/env python3
 """
-Quick Test Script for LoRA Model
-Runs a quick evaluation on a few samples.
+Complete Evaluation Script for LoRA Model
+Runs evaluation on ALL samples in test dataset.
 """
 
 import argparse
+import json
 import os
+from pathlib import Path
 
+import numpy as np
 import torch
 from diffusers import StableDiffusionInpaintPipeline
 from PIL import Image
+from tqdm import tqdm
 
 
-def quick_test(args):
-    """Quick test of the trained model"""
+def calculate_metrics(img1, img2):
+    """Calculate metrics between two images"""
+    # Convert to numpy arrays
+    arr1 = np.array(img1).astype(float)
+    arr2 = np.array(img2).astype(float)
+
+    metrics = {}
+
+    # PSNR
+    mse = np.mean((arr1 - arr2) ** 2)
+    if mse == 0:
+        metrics["psnr"] = float("inf")
+    else:
+        max_pixel = 255.0
+        metrics["psnr"] = 20 * np.log10(max_pixel / np.sqrt(mse))
+
+    # SSIM (simplified)
+    from skimage.metrics import structural_similarity as ssim
+
+    if len(arr1.shape) == 3:
+        # Convert to grayscale for SSIM
+        arr1_gray = np.mean(arr1, axis=2)
+        arr2_gray = np.mean(arr2, axis=2)
+        metrics["ssim"] = ssim(arr1_gray, arr2_gray, data_range=255)
+    else:
+        metrics["ssim"] = ssim(arr1, arr2, data_range=255)
+
+    # L1/L2 distances
+    metrics["l1"] = np.mean(np.abs(arr1 - arr2))
+    metrics["l2"] = np.sqrt(mse)
+
+    return metrics
+
+
+def evaluate_all_samples(args):
+    """Evaluate model on ALL test samples"""
+    print("=" * 60)
+    print("COMPLETE EVALUATION - ALL SAMPLES")
+    print("=" * 60)
+
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
     print("Loading pipeline...")
-
     # Load base pipeline
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
         args.model_path,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        torch_dtype=dtype,
+        safety_checker=None,
+        requires_safety_checker=False,
     )
 
     # Load LoRA weights
-    pipe.unet.load_attn_procs(args.lora_path)
+    print(f"Loading LoRA weights from {args.lora_path}")
+    try:
+        pipe.unet.load_attn_procs(args.lora_path)
+    except Exception as e:
+        print(f"Error loading LoRA weights: {e}")
+        print("Trying alternative loading method...")
+        # Try loading from safetensors
+        import safetensors.torch
+
+        safetensors_path = os.path.join(
+            args.lora_path, "pytorch_lora_weights.safetensors"
+        )
+        if os.path.exists(safetensors_path):
+            state_dict = safetensors.torch.load_file(safetensors_path, device="cpu")
+            pipe.unet.load_state_dict(state_dict, strict=False)
+            print("Loaded from safetensors")
+        else:
+            print("Warning: Could not load LoRA weights properly")
 
     # Move to device
-    if torch.cuda.is_available():
-        pipe = pipe.to("cuda")
+    pipe = pipe.to(device)
 
-    # Find test images
-    import glob
+    # Enable memory efficient attention if available
+    if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("Enabled xformers memory efficient attention")
+        except:
+            pass
 
-    test_files = glob.glob(os.path.join(args.test_data_dir, "erased", "*.png"))
-    test_files = test_files[:3]  # Test on first 3 images
+    # Find ALL test images
+    test_data_path = Path(args.test_data_dir)
+    erased_dir = test_data_path / "erased"
+    masks_dir = test_data_path / "masks"
+    orig_dir = test_data_path / "orig"
 
-    print(f"Testing on {len(test_files)} samples...")
+    if not all([erased_dir.exists(), masks_dir.exists(), orig_dir.exists()]):
+        print("Error: Missing required directories")
+        return
 
-    for test_file in test_files:
-        filename = os.path.basename(test_file).replace("_erased.png", "")
+    # Get ALL erased files
+    test_files = list(erased_dir.glob("*_erased.png"))
+    if not test_files:
+        # Try other patterns
+        test_files = list(erased_dir.glob("*.png"))
 
-        # Load corresponding mask and original
-        mask_file = os.path.join(args.test_data_dir, "masks", f"{filename}_mask.png")
-        orig_file = os.path.join(args.test_data_dir, "orig", f"{filename}.png")
+    if not test_files:
+        print(f"No test files found in {erased_dir}")
+        return
 
-        if not os.path.exists(mask_file) or not os.path.exists(orig_file):
-            print(f"Missing files for {filename}, skipping...")
+    print(f"Found {len(test_files)} samples to evaluate")
+
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create subdirectories
+    composites_dir = output_dir / "composites"
+    composites_dir.mkdir(exist_ok=True)
+
+    if args.save_individual:
+        generated_dir = output_dir / "generated"
+        generated_dir.mkdir(exist_ok=True)
+        input_dir = output_dir / "input"
+        input_dir.mkdir(exist_ok=True)
+        mask_dir = output_dir / "masks"
+        mask_dir.mkdir(exist_ok=True)
+        original_dir = output_dir / "originals"
+        original_dir.mkdir(exist_ok=True)
+
+    # Store all results
+    all_results = []
+    failed_samples = []
+
+    # Progress bar for all samples
+    progress_bar = tqdm(test_files, desc="Evaluating", unit="sample")
+
+    for test_file in progress_bar:
+        filename = test_file.stem
+
+        # Extract base name
+        if "_erased" in filename:
+            base_name = filename.replace("_erased", "")
+        else:
+            base_name = filename
+
+        # Find corresponding mask and original
+        mask_file = masks_dir / f"{base_name}_mask.png"
+        if not mask_file.exists():
+            mask_file = masks_dir / f"{base_name}.png"
+
+        orig_file = orig_dir / f"{base_name}.png"
+        if not orig_file.exists():
+            orig_file = orig_dir / f"{filename}.png"
+
+        if not mask_file.exists() or not orig_file.exists():
+            failed_samples.append(
+                {"filename": filename, "reason": "Missing mask or original file"}
+            )
             continue
 
-        # Load images
-        image = Image.open(test_file).convert("RGB")
-        mask_image = Image.open(mask_file).convert("L")
-        original = Image.open(orig_file).convert("RGB")
+        try:
+            # Load images
+            image = Image.open(test_file).convert("RGB")
+            mask_image = Image.open(mask_file).convert("L")
+            original = Image.open(orig_file).convert("RGB")
+        except Exception as e:
+            failed_samples.append(
+                {"filename": filename, "reason": f"Error loading images: {e}"}
+            )
+            continue
 
-        # Resize
-        image = image.resize((512, 512))
-        mask_image = mask_image.resize((512, 512))
-        original = original.resize((512, 512))
+        # Resize to target resolution
+        target_size = (args.resolution, args.resolution)
+        image = image.resize(target_size, Image.LANCZOS)
+        mask_image = mask_image.resize(target_size, Image.NEAREST)
+        original = original.resize(target_size, Image.LANCZOS)
+
+        # Use training prompt
+        prompt = "a damaged picture of a single emoji that needs to be repaired"
 
         # Generate
-        prompt = "a picture of a single emoji"
+        try:
+            result = pipe(
+                prompt=prompt,
+                image=image,
+                mask_image=mask_image,
+                num_inference_steps=args.num_steps,
+                guidance_scale=args.guidance_scale,
+                generator=torch.Generator(device).manual_seed(args.seed)
+                if args.seed
+                else None,
+            ).images[0]
+        except Exception as e:
+            failed_samples.append(
+                {"filename": filename, "reason": f"Error during generation: {e}"}
+            )
+            continue
 
-        print(f"Generating for {filename}...")
-        result = pipe(
-            prompt=prompt,
-            image=image,
-            mask_image=mask_image,
-            num_inference_steps=20,
-            guidance_scale=7.5,
-        ).images[0]
+        # Calculate metrics
+        metrics = calculate_metrics(result, original)
 
-        # Save results
-        output_dir = os.path.join(args.lora_path, "quick_test")
-        os.makedirs(output_dir, exist_ok=True)
+        # Save individual images if requested
+        if args.save_individual:
+            result.save(generated_dir / f"{filename}_generated.png")
+            image.save(input_dir / f"{filename}_input.png")
+            mask_image.save(mask_dir / f"{filename}_mask.png")
+            original.save(original_dir / f"{filename}_original.png")
 
-        # Create composite
-        composite = Image.new("RGB", (512 * 4, 512))
+        # Create and save composite
+        composite = Image.new("RGB", (target_size[0] * 4, target_size[1]))
         composite.paste(image, (0, 0))
-        composite.paste(mask_image.convert("RGB"), (512, 0))
-        composite.paste(original, (512 * 2, 0))
-        composite.paste(result, (512 * 3, 0))
+        composite.paste(mask_image.convert("RGB"), (target_size[0], 0))
+        composite.paste(original, (target_size[0] * 2, 0))
+        composite.paste(result, (target_size[0] * 3, 0))
 
-        composite.save(os.path.join(output_dir, f"{filename}_test.png"))
-        print(f"Saved result for {filename}")
+        composite_path = composites_dir / f"{filename}_composite.png"
+        composite.save(composite_path)
 
-    print(f"\nQuick test complete! Results saved to {output_dir}")
+        # Store result
+        sample_result = {
+            "filename": filename,
+            "metrics": metrics,
+            "composite_path": str(composite_path),
+            "input_path": str(test_file),
+            "mask_path": str(mask_file),
+            "original_path": str(orig_file),
+        }
+        all_results.append(sample_result)
+
+        # Update progress bar with current metrics
+        progress_bar.set_postfix(
+            {"PSNR": f"{metrics['psnr']:.1f}", "SSIM": f"{metrics['ssim']:.3f}"}
+        )
+
+    # Calculate overall statistics
+    if all_results:
+        metrics_names = ["psnr", "ssim", "l1", "l2"]
+        overall_stats = {}
+
+        for metric in metrics_names:
+            values = [r["metrics"][metric] for r in all_results]
+            overall_stats[metric] = {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
+                "min": float(np.min(values)),
+                "max": float(np.max(values)),
+                "median": float(np.median(values)),
+            }
+
+        # Save detailed results to JSON
+        results_dict = {
+            "config": vars(args),
+            "overall_statistics": overall_stats,
+            "individual_results": all_results,
+            "failed_samples": failed_samples,
+            "summary": {
+                "total_samples": len(test_files),
+                "successful_evaluations": len(all_results),
+                "failed_evaluations": len(failed_samples),
+                "success_rate": len(all_results) / len(test_files) * 100,
+            },
+        }
+
+        results_file = output_dir / "evaluation_results.json"
+        with open(results_file, "w") as f:
+            json.dump(results_dict, f, indent=2)
+
+        # Print comprehensive summary
+        print("\n" + "=" * 60)
+        print("EVALUATION COMPLETE - SUMMARY")
+        print("=" * 60)
+        print(f"Total samples: {len(test_files)}")
+        print(f"Successful: {len(all_results)}")
+        print(f"Failed: {len(failed_samples)}")
+        print(f"Success rate: {len(all_results) / len(test_files) * 100:.1f}%")
+
+        print("\nOVERALL METRICS:")
+        print(
+            f"PSNR:  {overall_stats['psnr']['mean']:.2f} ± {overall_stats['psnr']['std']:.2f} dB"
+        )
+        print(
+            f"       [Min: {overall_stats['psnr']['min']:.2f}, Max: {overall_stats['psnr']['max']:.2f}]"
+        )
+        print(
+            f"SSIM:  {overall_stats['ssim']['mean']:.4f} ± {overall_stats['ssim']['std']:.4f}"
+        )
+        print(
+            f"       [Min: {overall_stats['ssim']['min']:.4f}, Max: {overall_stats['ssim']['max']:.4f}]"
+        )
+        print(
+            f"L1:    {overall_stats['l1']['mean']:.2f} ± {overall_stats['l1']['std']:.2f}"
+        )
+        print(
+            f"L2:    {overall_stats['l2']['mean']:.2f} ± {overall_stats['l2']['std']:.2f}"
+        )
+
+        # Find best and worst samples
+        best_psnr = max(all_results, key=lambda x: x["metrics"]["psnr"])
+        worst_psnr = min(all_results, key=lambda x: x["metrics"]["psnr"])
+        best_ssim = max(all_results, key=lambda x: x["metrics"]["ssim"])
+        worst_ssim = min(all_results, key=lambda x: x["metrics"]["ssim"])
+
+        print("\nBEST/WORST SAMPLES:")
+        print(
+            f"Best PSNR:  {best_psnr['filename']} - {best_psnr['metrics']['psnr']:.2f} dB"
+        )
+        print(
+            f"Worst PSNR: {worst_psnr['filename']} - {worst_psnr['metrics']['psnr']:.2f} dB"
+        )
+        print(
+            f"Best SSIM:  {best_ssim['filename']} - {best_ssim['metrics']['ssim']:.4f}"
+        )
+        print(
+            f"Worst SSIM: {worst_ssim['filename']} - {worst_ssim['metrics']['ssim']:.4f}"
+        )
+
+        print(f"\nResults saved to: {output_dir}")
+        print(f"Detailed JSON: {results_file}")
+
+        # Save a simple text summary
+        summary_file = output_dir / "summary.txt"
+        with open(summary_file, "w") as f:
+            f.write("EVALUATION SUMMARY\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"Model: {args.model_path}\n")
+            f.write(f"LoRA: {args.lora_path}\n")
+            f.write(f"Test data: {args.test_data_dir}\n")
+            f.write(f"Resolution: {args.resolution}\n")
+            f.write(f"Total samples: {len(test_files)}\n")
+            f.write(f"Successful evaluations: {len(all_results)}\n")
+            f.write(
+                f"Success rate: {len(all_results) / len(test_files) * 100:.1f}%\n\n"
+            )
+            f.write("OVERALL METRICS:\n")
+            f.write(
+                f"PSNR:  {overall_stats['psnr']['mean']:.2f} ± {overall_stats['psnr']['std']:.2f} dB\n"
+            )
+            f.write(
+                f"SSIM:  {overall_stats['ssim']['mean']:.4f} ± {overall_stats['ssim']['std']:.4f}\n"
+            )
+            f.write(
+                f"L1:    {overall_stats['l1']['mean']:.2f} ± {overall_stats['l1']['std']:.2f}\n"
+            )
+            f.write(
+                f"L2:    {overall_stats['l2']['mean']:.2f} ± {overall_stats['l2']['std']:.2f}\n\n"
+            )
+            f.write("BEST/WORST SAMPLES:\n")
+            f.write(
+                f"Best PSNR:  {best_psnr['filename']} - {best_psnr['metrics']['psnr']:.2f} dB\n"
+            )
+            f.write(
+                f"Worst PSNR: {worst_psnr['filename']} - {worst_psnr['metrics']['psnr']:.2f} dB\n"
+            )
+            f.write(
+                f"Best SSIM:  {best_ssim['filename']} - {best_ssim['metrics']['ssim']:.4f}\n"
+            )
+            f.write(
+                f"Worst SSIM: {worst_ssim['filename']} - {worst_ssim['metrics']['ssim']:.4f}\n"
+            )
+
+        print(f"Text summary: {summary_file}")
+        print("=" * 60)
+
+    # Print failed samples if any
+    if failed_samples:
+        print("\nFAILED SAMPLES:")
+        for failed in failed_samples[:10]:  # Show first 10 failures
+            print(f"  {failed['filename']}: {failed['reason']}")
+        if len(failed_samples) > 10:
+            print(f"  ... and {len(failed_samples) - 10} more")
+
+    print("\nEvaluation complete!")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Evaluate LoRA model on ALL samples")
     parser.add_argument(
-        "--model_path", type=str, default="runwayml/stable-diffusion-inpainting"
+        "--model_path",
+        type=str,
+        default="runwayml/stable-diffusion-inpainting",
+        help="Base model path",
     )
-    parser.add_argument("--lora_path", type=str, required=True)
-    parser.add_argument("--test_data_dir", type=str, required=True)
+    parser.add_argument(
+        "--lora_path", type=str, required=True, help="Path to LoRA weights directory"
+    )
+    parser.add_argument(
+        "--test_data_dir", type=str, required=True, help="Path to test data directory"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="full_evaluation_results",
+        help="Output directory for results",
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=512,
+        help="Image resolution (should match training)",
+    )
+    parser.add_argument(
+        "--num_steps", type=int, default=20, help="Number of inference steps"
+    )
+    parser.add_argument(
+        "--guidance_scale", type=float, default=7.5, help="Guidance scale"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--save_individual",
+        action="store_true",
+        help="Save individual images in addition to composites",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size for evaluation (1 for stability)",
+    )
 
     args = parser.parse_args()
-    quick_test(args)
+    evaluate_all_samples(args)
