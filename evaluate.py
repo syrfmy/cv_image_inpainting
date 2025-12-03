@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Complete Evaluation Script for LoRA Model
-FIXED VERSION - Handles resolution mismatch
+FIXED VERSION - Correct mask inversion
 """
 
 import argparse
@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers import StableDiffusionInpaintPipeline
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 
@@ -63,8 +63,17 @@ def calculate_metrics(img1, img2):
     return metrics
 
 
+def invert_mask(mask_image):
+    """Safely invert a mask image: black->white, white->black"""
+    mask_array = np.array(mask_image)
+    # Invert: 0->255, 255->0, etc.
+    inverted_array = 255 - mask_array
+    # Convert back to PIL
+    return Image.fromarray(inverted_array).convert("L")
+
+
 def evaluate_all_samples(args):
-    """Evaluate model on ALL test samples - FIXED for consistent resolution"""
+    """Evaluate model on ALL test samples - FIXED for consistent resolution and mask inversion"""
     print("=" * 60)
     print("COMPLETE EVALUATION - ALL SAMPLES")
     print("=" * 60)
@@ -101,29 +110,23 @@ def evaluate_all_samples(args):
     except Exception as e:
         print(f"Error loading LoRA weights: {e}")
         # Try loading from safetensors directly
-        import safetensors.torch
+        try:
+            import safetensors.torch
 
-        safetensors_path = os.path.join(
-            args.lora_path, "pytorch_lora_weights.safetensors"
-        )
-        if os.path.exists(safetensors_path):
-            state_dict = safetensors.torch.load_file(safetensors_path, device="cpu")
-            pipe.unet.load_state_dict(state_dict, strict=False)
-            print("Loaded from safetensors")
-        else:
-            # Check if lora_path is actually a directory with unet
-            unet_path = os.path.join(args.lora_path, "unet")
-            if os.path.exists(unet_path):
-                pipe.unet = UNet2DConditionModel.from_pretrained(unet_path)
-                print("Loaded UNet from directory")
+            safetensors_path = os.path.join(
+                args.lora_path, "pytorch_lora_weights.safetensors"
+            )
+            if os.path.exists(safetensors_path):
+                state_dict = safetensors.torch.load_file(safetensors_path, device="cpu")
+                pipe.unet.load_state_dict(state_dict, strict=False)
+                print("Loaded from safetensors")
             else:
-                print("Warning: Could not load LoRA weights properly")
+                print("Warning: Could not load LoRA weights from safetensors")
+        except ImportError:
+            print("Warning: safetensors not installed")
 
     # Move to device
     pipe = pipe.to(device)
-
-    # Set pipeline to use target resolution
-    # For inpainting, we need to manually resize inputs
 
     # Enable memory efficient attention if available
     if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
@@ -141,6 +144,9 @@ def evaluate_all_samples(args):
 
     if not all([erased_dir.exists(), masks_dir.exists(), orig_dir.exists()]):
         print("Error: Missing required directories")
+        print(f"  erased exists: {erased_dir.exists()}")
+        print(f"  masks exists: {masks_dir.exists()}")
+        print(f"  orig exists: {orig_dir.exists()}")
         return
 
     # Get ALL erased files
@@ -166,6 +172,12 @@ def evaluate_all_samples(args):
     if args.save_individual:
         generated_dir = output_dir / "generated"
         generated_dir.mkdir(exist_ok=True)
+        input_dir = output_dir / "input"
+        input_dir.mkdir(exist_ok=True)
+        mask_dir = output_dir / "masks"
+        mask_dir.mkdir(exist_ok=True)
+        original_dir = output_dir / "originals"
+        original_dir.mkdir(exist_ok=True)
 
     # Store all results
     all_results = []
@@ -192,9 +204,14 @@ def evaluate_all_samples(args):
         if not orig_file.exists():
             orig_file = orig_dir / f"{filename}.png"
 
-        if not mask_file.exists() or not orig_file.exists():
+        if not mask_file.exists():
             failed_samples.append(
-                {"filename": filename, "reason": "Missing mask or original file"}
+                {"filename": filename, "reason": f"Missing mask file: {mask_file}"}
+            )
+            continue
+        if not orig_file.exists():
+            failed_samples.append(
+                {"filename": filename, "reason": f"Missing original file: {orig_file}"}
             )
             continue
 
@@ -209,36 +226,51 @@ def evaluate_all_samples(args):
             )
             continue
 
-        # DEBUG: Print original sizes
+        # DEBUG: Print original sizes and mask info for first sample
         if len(all_results) == 0:
-            print(f"\nDebug - Image sizes:")
+            print(f"\nDebug - First sample ({filename}):")
             print(f"  Input image: {image.size}")
             print(f"  Mask image: {mask_image.size}")
             print(f"  Original image: {original.size}")
+
+            # Check mask values
+            mask_array = np.array(mask_image)
+            unique_vals = np.unique(mask_array)
+            print(f"  Mask unique values: {unique_vals}")
+            print(f"  Mask min: {mask_array.min()}, max: {mask_array.max()}")
+            print(f"  Mask mean: {mask_array.mean():.1f}")
 
         # Resize ALL images to target resolution
         image = image.resize(TARGET_SIZE, Image.LANCZOS)
         mask_image = mask_image.resize(TARGET_SIZE, Image.NEAREST)
         original_resized = original.resize(TARGET_SIZE, Image.LANCZOS)
-        mask_image_inverted = ImageOps.invert(mask_image)
 
-        # Use training prompt
-        prompt = "a picture of a single emoji that needs to be repaired"
+        # INVERT THE MASK for Stable Diffusion
+        # If your training used black=damage, you need to invert for SD
+        mask_image_inverted = invert_mask(mask_image)
 
-        # Generate - FIX: Ensure pipeline uses correct size
+        # DEBUG: Check inverted mask for first sample
+        if len(all_results) == 0:
+            inv_array = np.array(mask_image_inverted)
+            print(f"  Inverted mask min: {inv_array.min()}, max: {inv_array.max()}")
+            print(f"  Inverted mask mean: {inv_array.mean():.1f}")
+
+        # Use training prompt (make sure this matches your training prompt!)
+        prompt = "a damaged picture of a single emoji that needs to be repaired"
+
+        # Generate - use INVERTED mask
         try:
-            # Manually prepare inputs with correct size
             result = pipe(
                 prompt=prompt,
-                image=image,  # Already resized
-                mask_image=mask_image_inverted,  # Already resized
+                image=image,
+                mask_image=mask_image_inverted,  # Use INVERTED mask
                 num_inference_steps=args.num_steps,
                 guidance_scale=args.guidance_scale,
                 generator=torch.Generator(device).manual_seed(args.seed)
                 if args.seed
                 else None,
-                height=TARGET_SIZE[1],  # Explicitly set height
-                width=TARGET_SIZE[0],  # Explicitly set width
+                height=TARGET_SIZE[1],
+                width=TARGET_SIZE[0],
             ).images[0]
         except Exception as e:
             failed_samples.append(
@@ -246,7 +278,7 @@ def evaluate_all_samples(args):
             )
             continue
 
-        # DEBUG: Check generated image size
+        # DEBUG: Check generated image size for first sample
         if len(all_results) == 0:
             print(f"  Generated image: {result.size}")
 
@@ -260,15 +292,16 @@ def evaluate_all_samples(args):
         # Calculate metrics - use resized original
         metrics = calculate_metrics(result, original_resized)
 
-        # Save generated image if requested
+        # Save individual images if requested
         if args.save_individual:
             result.save(generated_dir / f"{filename}_generated.png")
+            image.save(input_dir / f"{filename}_input.png")
+            mask_image.save(mask_dir / f"{filename}_mask.png")
+            mask_image_inverted.save(mask_dir / f"{filename}_mask_inverted.png")
+            original_resized.save(original_dir / f"{filename}_original.png")
 
         # Create and save composite with labels
         composite = Image.new("RGB", (TARGET_SIZE[0] * 4, TARGET_SIZE[1]))
-
-        # Add labels (optional)
-        from PIL import ImageDraw, ImageFont
 
         # Paste images
         composite.paste(image, (0, 0))
