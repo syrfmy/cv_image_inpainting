@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Complete Evaluation Script for LoRA Model
-FIXED VERSION - Correct mask inversion
+Optimized for 64x64 images with proper collages
 """
 
 import argparse
@@ -17,19 +17,14 @@ from tqdm import tqdm
 
 
 def calculate_metrics(img1, img2):
-    """Calculate metrics between two images - FIXED for shape matching"""
+    """Calculate metrics between two images"""
     # Ensure both images are the same size
     if img1.size != img2.size:
-        # Resize img2 to match img1
         img2 = img2.resize(img1.size, Image.LANCZOS)
 
     # Convert to numpy arrays
     arr1 = np.array(img1).astype(float)
     arr2 = np.array(img2).astype(float)
-
-    # Check shapes match
-    if arr1.shape != arr2.shape:
-        raise ValueError(f"Shape mismatch after resizing: {arr1.shape} vs {arr2.shape}")
 
     metrics = {}
 
@@ -41,21 +36,6 @@ def calculate_metrics(img1, img2):
         max_pixel = 255.0
         metrics["psnr"] = 20 * np.log10(max_pixel / np.sqrt(mse))
 
-    # SSIM
-    try:
-        from skimage.metrics import structural_similarity as ssim
-
-        if len(arr1.shape) == 3:
-            # Convert to grayscale for SSIM
-            arr1_gray = np.mean(arr1, axis=2)
-            arr2_gray = np.mean(arr2, axis=2)
-            metrics["ssim"] = ssim(arr1_gray, arr2_gray, data_range=255)
-        else:
-            metrics["ssim"] = ssim(arr1, arr2, data_range=255)
-    except ImportError:
-        metrics["ssim"] = 0.0
-        print("Warning: skimage not installed, SSIM set to 0")
-
     # L1/L2 distances
     metrics["l1"] = np.mean(np.abs(arr1 - arr2))
     metrics["l2"] = np.sqrt(mse)
@@ -63,24 +43,129 @@ def calculate_metrics(img1, img2):
     return metrics
 
 
-def invert_mask(mask_image):
-    """Safely invert a mask image: black->white, white->black"""
-    mask_array = np.array(mask_image)
-    # Invert: 0->255, 255->0, etc.
-    inverted_array = 255 - mask_array
-    # Convert back to PIL
-    return Image.fromarray(inverted_array).convert("L")
+def create_collage(
+    erased_img,
+    mask_img,
+    orig_img,
+    generated_img,
+    filename,
+    metrics,
+    save_dir,
+    target_size=(64, 64),
+):
+    """Create a comprehensive collage image with all components and metrics"""
+
+    # Create a larger canvas to hold everything
+    # Layout: 2x2 grid of images with space for text
+    cell_width = target_size[0]
+    cell_height = target_size[1]
+    padding = 10
+    text_height = 40
+
+    # Calculate total canvas size
+    canvas_width = cell_width * 2 + padding * 3
+    canvas_height = cell_height * 2 + padding * 3 + text_height * 2
+
+    # Create canvas
+    canvas = Image.new("RGB", (canvas_width, canvas_height), color="white")
+    draw = ImageDraw.Draw(canvas)
+
+    # Try to load font
+    try:
+        font_large = ImageFont.truetype("arial.ttf", 16)
+        font_small = ImageFont.truetype("arial.ttf", 12)
+    except:
+        font_large = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+
+    # Title
+    draw.text(
+        (canvas_width // 2, 5),
+        f"Evaluation: {filename}",
+        fill="black",
+        font=font_large,
+        anchor="mt",
+    )
+
+    # Row 1: Erased and Mask
+    y_offset = text_height
+
+    # Erased image
+    canvas.paste(erased_img.resize(target_size, Image.LANCZOS), (padding, y_offset))
+    draw.text(
+        (padding + cell_width // 2, y_offset + cell_height + 5),
+        "Erased (Input)",
+        fill="black",
+        font=font_small,
+        anchor="mt",
+    )
+
+    # Mask image
+    canvas.paste(
+        mask_img.convert("RGB").resize(target_size, Image.NEAREST),
+        (cell_width + padding * 2, y_offset),
+    )
+    draw.text(
+        (cell_width + padding * 2 + cell_width // 2, y_offset + cell_height + 5),
+        "Mask",
+        fill="black",
+        font=font_small,
+        anchor="mt",
+    )
+
+    # Row 2: Original and Generated
+    y_offset += cell_height + text_height
+
+    # Original image
+    canvas.paste(orig_img.resize(target_size, Image.LANCZOS), (padding, y_offset))
+    draw.text(
+        (padding + cell_width // 2, y_offset + cell_height + 5),
+        "Original (Ground Truth)",
+        fill="black",
+        font=font_small,
+        anchor="mt",
+    )
+
+    # Generated image
+    canvas.paste(
+        generated_img.resize(target_size, Image.LANCZOS),
+        (cell_width + padding * 2, y_offset),
+    )
+    draw.text(
+        (cell_width + padding * 2 + cell_width // 2, y_offset + cell_height + 5),
+        "Generated (Output)",
+        fill="black",
+        font=font_small,
+        anchor="mt",
+    )
+
+    # Metrics at the bottom
+    y_offset += cell_height + text_height
+
+    metrics_text = f"PSNR: {metrics['psnr']:.2f} dB | L1: {metrics['l1']:.3f} | L2: {metrics['l2']:.3f}"
+    draw.text(
+        (canvas_width // 2, canvas_height - 25),
+        metrics_text,
+        fill="black",
+        font=font_small,
+        anchor="mt",
+    )
+
+    # Save
+    output_path = save_dir / f"{filename}_collage.png"
+    canvas.save(output_path)
+
+    return output_path
 
 
 def evaluate_all_samples(args):
-    """Evaluate model on ALL test samples - FIXED for consistent resolution and mask inversion"""
+    """Evaluate model on ALL test samples"""
     print("=" * 60)
-    print("COMPLETE EVALUATION - ALL SAMPLES")
+    print("COMPLETE EVALUATION - 64x64 IMAGES")
     print("=" * 60)
 
-    # IMPORTANT: Set the resolution based on training
-    # If you trained on 64x64, use 64x64 for evaluation
-    TARGET_SIZE = (args.resolution, args.resolution)
+    # Fixed for 64x64 training
+    TARGET_SIZE = (64, 64)
     print(f"Target resolution: {TARGET_SIZE[0]}x{TARGET_SIZE[1]}")
 
     # Set device
@@ -88,7 +173,7 @@ def evaluate_all_samples(args):
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
     print("Loading pipeline...")
-    # Load base pipeline with correct parameters
+    # Load pipeline
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
         args.model_path,
         torch_dtype=dtype,
@@ -96,20 +181,16 @@ def evaluate_all_samples(args):
         requires_safety_checker=False,
     )
 
-    # Load LoRA weights using the new method
+    # Load LoRA weights
     print(f"Loading LoRA weights from {args.lora_path}")
     try:
-        # Try the new load_lora_weights method
         if hasattr(pipe, "load_lora_weights"):
             pipe.load_lora_weights(args.lora_path)
-            print("Loaded LoRA weights using load_lora_weights()")
         else:
-            # Fall back to old method
             pipe.unet.load_attn_procs(args.lora_path)
-            print("Loaded LoRA weights using load_attn_procs()")
     except Exception as e:
         print(f"Error loading LoRA weights: {e}")
-        # Try loading from safetensors directly
+        # Try alternative loading
         try:
             import safetensors.torch
 
@@ -120,23 +201,13 @@ def evaluate_all_samples(args):
                 state_dict = safetensors.torch.load_file(safetensors_path, device="cpu")
                 pipe.unet.load_state_dict(state_dict, strict=False)
                 print("Loaded from safetensors")
-            else:
-                print("Warning: Could not load LoRA weights from safetensors")
-        except ImportError:
-            print("Warning: safetensors not installed")
+        except:
+            print("Warning: Using base model only")
 
     # Move to device
     pipe = pipe.to(device)
 
-    # Enable memory efficient attention if available
-    if hasattr(pipe, "enable_xformers_memory_efficient_attention"):
-        try:
-            pipe.enable_xformers_memory_efficient_attention()
-            print("Enabled xformers memory efficient attention")
-        except:
-            pass
-
-    # Find ALL test images
+    # Find test images
     test_data_path = Path(args.test_data_dir)
     erased_dir = test_data_path / "erased"
     masks_dir = test_data_path / "masks"
@@ -144,15 +215,11 @@ def evaluate_all_samples(args):
 
     if not all([erased_dir.exists(), masks_dir.exists(), orig_dir.exists()]):
         print("Error: Missing required directories")
-        print(f"  erased exists: {erased_dir.exists()}")
-        print(f"  masks exists: {masks_dir.exists()}")
-        print(f"  orig exists: {orig_dir.exists()}")
         return
 
-    # Get ALL erased files
+    # Get all erased files
     test_files = list(erased_dir.glob("*_erased.png"))
     if not test_files:
-        # Try other patterns
         test_files = list(erased_dir.glob("*.png"))
 
     if not test_files:
@@ -166,24 +233,18 @@ def evaluate_all_samples(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Create subdirectories
-    composites_dir = output_dir / "composites"
-    composites_dir.mkdir(exist_ok=True)
+    collages_dir = output_dir / "collages"
+    collages_dir.mkdir(exist_ok=True)
 
     if args.save_individual:
-        generated_dir = output_dir / "generated"
-        generated_dir.mkdir(exist_ok=True)
-        input_dir = output_dir / "input"
-        input_dir.mkdir(exist_ok=True)
-        mask_dir = output_dir / "masks"
-        mask_dir.mkdir(exist_ok=True)
-        original_dir = output_dir / "originals"
-        original_dir.mkdir(exist_ok=True)
+        individual_dir = output_dir / "individual"
+        individual_dir.mkdir(exist_ok=True)
 
-    # Store all results
+    # Store results
     all_results = []
     failed_samples = []
 
-    # Progress bar for all samples
+    # Progress bar
     progress_bar = tqdm(test_files, desc="Evaluating", unit="sample")
 
     for test_file in progress_bar:
@@ -195,189 +256,142 @@ def evaluate_all_samples(args):
         else:
             base_name = filename
 
-        # Find corresponding mask and original
+        # Find corresponding files
         mask_file = masks_dir / f"{base_name}_mask.png"
-        if not mask_file.exists():
-            mask_file = masks_dir / f"{base_name}.png"
-
         orig_file = orig_dir / f"{base_name}.png"
-        if not orig_file.exists():
-            orig_file = orig_dir / f"{filename}.png"
 
-        if not mask_file.exists():
-            failed_samples.append(
-                {"filename": filename, "reason": f"Missing mask file: {mask_file}"}
-            )
-            continue
-        if not orig_file.exists():
-            failed_samples.append(
-                {"filename": filename, "reason": f"Missing original file: {orig_file}"}
-            )
+        if not mask_file.exists() or not orig_file.exists():
+            failed_samples.append({"filename": filename, "reason": "Missing files"})
             continue
 
         try:
             # Load images
-            image = Image.open(test_file).convert("RGB")
-            mask_image = Image.open(mask_file).convert("L")
-            original = Image.open(orig_file).convert("RGB")
+            erased_img = Image.open(test_file).convert("RGB")
+            mask_img = Image.open(mask_file).convert("L")
+            orig_img = Image.open(orig_file).convert("RGB")
         except Exception as e:
-            failed_samples.append(
-                {"filename": filename, "reason": f"Error loading images: {e}"}
-            )
+            failed_samples.append({"filename": filename, "reason": f"Load error: {e}"})
             continue
 
-        # DEBUG: Print original sizes and mask info for first sample
-        if len(all_results) == 0:
-            print(f"\nDebug - First sample ({filename}):")
-            print(f"  Input image: {image.size}")
-            print(f"  Mask image: {mask_image.size}")
-            print(f"  Original image: {original.size}")
+        # Resize to 64x64
+        erased_img = erased_img.resize(TARGET_SIZE, Image.LANCZOS)
+        mask_img = mask_img.resize(TARGET_SIZE, Image.NEAREST)
+        orig_img_resized = orig_img.resize(TARGET_SIZE, Image.LANCZOS)
 
-            # Check mask values
-            mask_array = np.array(mask_image)
-            unique_vals = np.unique(mask_array)
-            print(f"  Mask unique values: {unique_vals}")
-            print(f"  Mask min: {mask_array.min()}, max: {mask_array.max()}")
-            print(f"  Mask mean: {mask_array.mean():.1f}")
+        # Invert mask for Stable Diffusion (black damage -> white damage)
+        mask_array = np.array(mask_img)
+        mask_inverted = Image.fromarray(255 - mask_array).convert("L")
 
-        # Resize ALL images to target resolution
-        image = image.resize(TARGET_SIZE, Image.LANCZOS)
-        mask_image = mask_image.resize(TARGET_SIZE, Image.NEAREST)
-        original_resized = original.resize(TARGET_SIZE, Image.LANCZOS)
-
-        # INVERT THE MASK for Stable Diffusion
-        # If your training used black=damage, you need to invert for SD
-        mask_image_inverted = invert_mask(mask_image)
-
-        # DEBUG: Check inverted mask for first sample
-        if len(all_results) == 0:
-            inv_array = np.array(mask_image_inverted)
-            print(f"  Inverted mask min: {inv_array.min()}, max: {inv_array.max()}")
-            print(f"  Inverted mask mean: {inv_array.mean():.1f}")
-
-        # Use training prompt (make sure this matches your training prompt!)
+        # Generate
         prompt = "a damaged picture of a single emoji that needs to be repaired"
 
-        # Generate - use INVERTED mask
         try:
-            result = pipe(
+            generated_img = pipe(
                 prompt=prompt,
-                image=image,
-                mask_image=mask_image_inverted,  # Use INVERTED mask
+                image=erased_img,
+                mask_image=mask_inverted,
                 num_inference_steps=args.num_steps,
                 guidance_scale=args.guidance_scale,
-                generator=torch.Generator(device).manual_seed(args.seed)
-                if args.seed
-                else None,
                 height=TARGET_SIZE[1],
                 width=TARGET_SIZE[0],
             ).images[0]
         except Exception as e:
             failed_samples.append(
-                {"filename": filename, "reason": f"Error during generation: {e}"}
+                {"filename": filename, "reason": f"Generation error: {e}"}
             )
             continue
 
-        # DEBUG: Check generated image size for first sample
-        if len(all_results) == 0:
-            print(f"  Generated image: {result.size}")
+        # Resize if needed
+        if generated_img.size != TARGET_SIZE:
+            generated_img = generated_img.resize(TARGET_SIZE, Image.LANCZOS)
 
-        # Ensure generated image is correct size (resize if needed)
-        if result.size != TARGET_SIZE:
-            print(
-                f"Warning: Generated image size {result.size} doesn't match target {TARGET_SIZE}"
-            )
-            result = result.resize(TARGET_SIZE, Image.LANCZOS)
+        # Calculate metrics
+        metrics = calculate_metrics(generated_img, orig_img_resized)
 
-        # Calculate metrics - use resized original
-        metrics = calculate_metrics(result, original_resized)
+        # Create comprehensive collage
+        collage_path = create_collage(
+            erased_img,
+            mask_img,
+            orig_img_resized,
+            generated_img,
+            filename,
+            metrics,
+            collages_dir,
+            TARGET_SIZE,
+        )
 
         # Save individual images if requested
         if args.save_individual:
-            result.save(generated_dir / f"{filename}_generated.png")
-            image.save(input_dir / f"{filename}_input.png")
-            mask_image.save(mask_dir / f"{filename}_mask.png")
-            mask_image_inverted.save(mask_dir / f"{filename}_mask_inverted.png")
-            original_resized.save(original_dir / f"{filename}_original.png")
-
-        # Create and save composite with labels
-        composite = Image.new("RGB", (TARGET_SIZE[0] * 4, TARGET_SIZE[1]))
-
-        # Paste images
-        composite.paste(image, (0, 0))
-        composite.paste(mask_image.convert("RGB"), (TARGET_SIZE[0], 0))
-        composite.paste(original_resized, (TARGET_SIZE[0] * 2, 0))
-        composite.paste(result, (TARGET_SIZE[0] * 3, 0))
-
-        # Add text labels if space permits
-        try:
-            draw = ImageDraw.Draw(composite)
-            # Try to load a font
-            try:
-                font = ImageFont.truetype("arial.ttf", 20)
-            except:
-                font = ImageFont.load_default()
-
-            labels = ["Input", "Mask", "Original", "Generated"]
-            for i, label in enumerate(labels):
-                draw.text(
-                    (i * TARGET_SIZE[0] + 10, 10),
-                    label,
-                    fill="white",
-                    stroke_width=2,
-                    stroke_fill="black",
-                    font=font,
-                )
-        except:
-            pass  # Skip text if it fails
-
-        composite_path = composites_dir / f"{filename}_composite.png"
-        composite.save(composite_path)
+            erased_img.save(individual_dir / f"{filename}_erased.png")
+            mask_img.save(individual_dir / f"{filename}_mask.png")
+            mask_inverted.save(individual_dir / f"{filename}_mask_inverted.png")
+            orig_img_resized.save(individual_dir / f"{filename}_original.png")
+            generated_img.save(individual_dir / f"{filename}_generated.png")
 
         # Store result
         sample_result = {
             "filename": filename,
             "metrics": metrics,
-            "composite_path": str(composite_path),
-            "input_size": image.size,
-            "generated_size": result.size,
-            "original_size": original.size,
+            "collage_path": str(collage_path),
+            "psnr": metrics["psnr"],
+            "l1": metrics["l1"],
+            "l2": metrics["l2"],
         }
         all_results.append(sample_result)
 
-        # Update progress bar with current metrics
+        # Update progress
         progress_bar.set_postfix(
-            {"PSNR": f"{metrics['psnr']:.1f}", "SSIM": f"{metrics['ssim']:.3f}"}
+            {"PSNR": f"{metrics['psnr']:.1f}", "L1": f"{metrics['l1']:.3f}"}
         )
 
-    # Calculate overall statistics
+    # Generate summary
     if all_results:
-        metrics_names = ["psnr", "ssim", "l1", "l2"]
-        overall_stats = {}
+        # Calculate statistics
+        psnr_values = [r["psnr"] for r in all_results]
+        l1_values = [r["l1"] for r in all_results]
+        l2_values = [r["l2"] for r in all_results]
 
-        for metric in metrics_names:
-            values = [r["metrics"][metric] for r in all_results]
-            overall_stats[metric] = {
-                "mean": float(np.mean(values)),
-                "std": float(np.std(values)),
-                "min": float(np.min(values)),
-                "max": float(np.max(values)),
-                "median": float(np.median(values)),
-            }
+        stats = {
+            "psnr": {
+                "mean": float(np.mean(psnr_values)),
+                "std": float(np.std(psnr_values)),
+                "min": float(np.min(psnr_values)),
+                "max": float(np.max(psnr_values)),
+                "median": float(np.median(psnr_values)),
+            },
+            "l1": {
+                "mean": float(np.mean(l1_values)),
+                "std": float(np.std(l1_values)),
+                "min": float(np.min(l1_values)),
+                "max": float(np.max(l1_values)),
+                "median": float(np.median(l1_values)),
+            },
+            "l2": {
+                "mean": float(np.mean(l2_values)),
+                "std": float(np.std(l2_values)),
+                "min": float(np.min(l2_values)),
+                "max": float(np.max(l2_values)),
+                "median": float(np.median(l2_values)),
+            },
+        }
 
-        # Save detailed results to JSON
+        # Find best and worst
+        best_psnr = max(all_results, key=lambda x: x["psnr"])
+        worst_psnr = min(all_results, key=lambda x: x["psnr"])
+        best_l1 = min(all_results, key=lambda x: x["l1"])
+        worst_l1 = max(all_results, key=lambda x: x["l1"])
+
+        # Save results
         results_dict = {
             "config": vars(args),
-            "overall_statistics": overall_stats,
-            "individual_results": all_results,
-            "failed_samples": failed_samples,
+            "statistics": stats,
+            "samples": all_results,
+            "failed": failed_samples,
             "summary": {
-                "total_samples": len(test_files),
-                "successful_evaluations": len(all_results),
-                "failed_evaluations": len(failed_samples),
-                "success_rate": len(all_results) / len(test_files) * 100
-                if len(test_files) > 0
-                else 0,
+                "total": len(test_files),
+                "successful": len(all_results),
+                "failed": len(failed_samples),
+                "success_rate": f"{(len(all_results) / len(test_files) * 100):.1f}%",
             },
         }
 
@@ -385,118 +399,102 @@ def evaluate_all_samples(args):
         with open(results_file, "w") as f:
             json.dump(results_dict, f, indent=2)
 
-        # Print comprehensive summary
+        # Print summary
         print("\n" + "=" * 60)
-        print("EVALUATION COMPLETE - SUMMARY")
+        print("EVALUATION SUMMARY")
         print("=" * 60)
         print(f"Total samples: {len(test_files)}")
         print(f"Successful: {len(all_results)}")
         print(f"Failed: {len(failed_samples)}")
-        print(
-            f"Success rate: {len(all_results) / len(test_files) * 100:.1f}%"
-            if len(test_files) > 0
-            else "N/A"
-        )
+        print(f"Success rate: {(len(all_results) / len(test_files) * 100):.1f}%")
 
-        if len(all_results) > 0:
-            print("\nOVERALL METRICS:")
-            print(
-                f"PSNR:  {overall_stats['psnr']['mean']:.2f} ± {overall_stats['psnr']['std']:.2f} dB"
-            )
-            print(
-                f"       [Min: {overall_stats['psnr']['min']:.2f}, Max: {overall_stats['psnr']['max']:.2f}]"
-            )
-            print(
-                f"SSIM:  {overall_stats['ssim']['mean']:.4f} ± {overall_stats['ssim']['std']:.4f}"
-            )
-            print(
-                f"       [Min: {overall_stats['ssim']['min']:.4f}, Max: {overall_stats['ssim']['max']:.4f}]"
-            )
-            print(
-                f"L1:    {overall_stats['l1']['mean']:.2f} ± {overall_stats['l1']['std']:.2f}"
-            )
-            print(
-                f"L2:    {overall_stats['l2']['mean']:.2f} ± {overall_stats['l2']['std']:.2f}"
-            )
+        print(f"\nPSNR: {stats['psnr']['mean']:.2f} ± {stats['psnr']['std']:.2f} dB")
+        print(f"     Best: {best_psnr['psnr']:.2f} dB ({best_psnr['filename']})")
+        print(f"     Worst: {worst_psnr['psnr']:.2f} dB ({worst_psnr['filename']})")
 
-            # Find best and worst samples
-            best_psnr = max(all_results, key=lambda x: x["metrics"]["psnr"])
-            worst_psnr = min(all_results, key=lambda x: x["metrics"]["psnr"])
-            best_ssim = max(all_results, key=lambda x: x["metrics"]["ssim"])
-            worst_ssim = min(all_results, key=lambda x: x["metrics"]["ssim"])
-
-            print("\nBEST/WORST SAMPLES:")
-            print(
-                f"Best PSNR:  {best_psnr['filename']} - {best_psnr['metrics']['psnr']:.2f} dB"
-            )
-            print(
-                f"Worst PSNR: {worst_psnr['filename']} - {worst_psnr['metrics']['psnr']:.2f} dB"
-            )
-            print(
-                f"Best SSIM:  {best_ssim['filename']} - {best_ssim['metrics']['ssim']:.4f}"
-            )
-            print(
-                f"Worst SSIM: {worst_ssim['filename']} - {worst_ssim['metrics']['ssim']:.4f}"
-            )
+        print(f"\nL1 Distance: {stats['l1']['mean']:.4f} ± {stats['l1']['std']:.4f}")
+        print(f"     Best: {best_l1['l1']:.4f} ({best_l1['filename']})")
+        print(f"     Worst: {worst_l1['l1']:.4f} ({worst_l1['filename']})")
 
         print(f"\nResults saved to: {output_dir}")
-        print(f"Detailed JSON: {results_file}")
+        print(f"Collages: {collages_dir}")
+        print(f"JSON report: {results_file}")
 
-        # Save a simple text summary
-        summary_file = output_dir / "summary.txt"
-        with open(summary_file, "w") as f:
-            f.write("EVALUATION SUMMARY\n")
-            f.write("=" * 60 + "\n")
-            f.write(f"Model: {args.model_path}\n")
-            f.write(f"LoRA: {args.lora_path}\n")
-            f.write(f"Test data: {args.test_data_dir}\n")
-            f.write(f"Resolution: {args.resolution}\n")
-            f.write(f"Total samples: {len(test_files)}\n")
-            f.write(f"Successful evaluations: {len(all_results)}\n")
-            if len(all_results) > 0:
-                f.write(
-                    f"Success rate: {len(all_results) / len(test_files) * 100:.1f}%\n\n"
-                )
-                f.write("OVERALL METRICS:\n")
-                f.write(
-                    f"PSNR:  {overall_stats['psnr']['mean']:.2f} ± {overall_stats['psnr']['std']:.2f} dB\n"
-                )
-                f.write(
-                    f"SSIM:  {overall_stats['ssim']['mean']:.4f} ± {overall_stats['ssim']['std']:.4f}\n"
-                )
-                f.write(
-                    f"L1:    {overall_stats['l1']['mean']:.2f} ± {overall_stats['l1']['std']:.2f}\n"
-                )
-                f.write(
-                    f"L2:    {overall_stats['l2']['mean']:.2f} ± {overall_stats['l2']['std']:.2f}\n\n"
-                )
-                f.write("BEST/WORST SAMPLES:\n")
-                f.write(
-                    f"Best PSNR:  {best_psnr['filename']} - {best_psnr['metrics']['psnr']:.2f} dB\n"
-                )
-                f.write(
-                    f"Worst PSNR: {worst_psnr['filename']} - {worst_psnr['metrics']['psnr']:.2f} dB\n"
-                )
-                f.write(
-                    f"Best SSIM:  {best_ssim['filename']} - {best_ssim['metrics']['ssim']:.4f}\n"
-                )
-                f.write(
-                    f"Worst SSIM: {worst_ssim['filename']} - {worst_ssim['metrics']['ssim']:.4f}\n"
-                )
+        # Create quick visual summary
+        if len(all_results) >= 9:
+            print("\nCreating visual summary grid...")
+            create_summary_grid(all_results, collages_dir, output_dir)
 
-    # Print failed samples if any
+    # Show failures
     if failed_samples:
-        print("\nFAILED SAMPLES:")
-        for failed in failed_samples[:10]:  # Show first 10 failures
+        print(f"\nFailed samples ({len(failed_samples)}):")
+        for failed in failed_samples[:5]:
             print(f"  {failed['filename']}: {failed['reason']}")
-        if len(failed_samples) > 10:
-            print(f"  ... and {len(failed_samples) - 10} more")
+        if len(failed_samples) > 5:
+            print(f"  ... and {len(failed_samples) - 5} more")
 
-    print("\nEvaluation complete!")
+    print("\n" + "=" * 60)
+    print("Evaluation complete!")
+    print("=" * 60)
+
+
+def create_summary_grid(all_results, collages_dir, output_dir):
+    """Create a grid of sample collages for quick visual inspection"""
+    # Sort by PSNR (best first)
+    sorted_results = sorted(all_results, key=lambda x: x["psnr"], reverse=True)
+
+    # Take top 9 results
+    top_results = sorted_results[:9]
+
+    # Create 3x3 grid
+    grid_size = 3
+    collage_size = 64 * 2 + 20  # Approximate collage size
+
+    grid_width = collage_size * grid_size
+    grid_height = collage_size * grid_size
+
+    grid_canvas = Image.new("RGB", (grid_width, grid_height), color="white")
+
+    for i, result in enumerate(top_results):
+        row = i // grid_size
+        col = i % grid_size
+
+        try:
+            collage = Image.open(result["collage_path"])
+            # Resize collage to fit grid
+            collage_resized = collage.resize(
+                (collage_size, collage_size), Image.LANCZOS
+            )
+
+            x_pos = col * collage_size
+            y_pos = row * collage_size
+
+            grid_canvas.paste(collage_resized, (x_pos, y_pos))
+        except:
+            continue
+
+    # Add title
+    draw = ImageDraw.Draw(grid_canvas)
+    try:
+        font = ImageFont.truetype("arial.ttf", 20)
+    except:
+        font = ImageFont.load_default()
+
+    draw.text(
+        (grid_width // 2, 10),
+        "Top 9 Results (by PSNR)",
+        fill="black",
+        font=font,
+        anchor="mt",
+    )
+
+    grid_path = output_dir / "summary_grid.png"
+    grid_canvas.save(grid_path)
+    print(f"Summary grid saved to: {grid_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate LoRA model on ALL samples")
+    parser = argparse.ArgumentParser(description="Evaluate LoRA model on 64x64 images")
     parser.add_argument(
         "--model_path",
         type=str,
@@ -512,14 +510,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="full_evaluation_results",
+        default="evaluation_results_64x64",
         help="Output directory for results",
-    )
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=64,  # CHANGED: Default to 64 since you trained on 64x64
-        help="Image resolution (should match training - you trained on 64x64!)",
     )
     parser.add_argument(
         "--num_steps", type=int, default=20, help="Number of inference steps"
@@ -527,28 +519,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--guidance_scale", type=float, default=7.5, help="Guidance scale"
     )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
-        "--seed", type=int, default=42, help="Random seed for reproducibility"
+        "--save_individual", action="store_true", help="Save individual images"
     )
     parser.add_argument(
-        "--save_individual",
-        action="store_true",
-        help="Save individual images in addition to composites",
+        "--batch_size", type=int, default=1, help="Batch size for evaluation"
     )
 
     args = parser.parse_args()
 
-    # IMPORTANT WARNING
-    if args.resolution != 64:
-        print(
-            f"\n⚠️  WARNING: You trained on 64x64 but are evaluating on {args.resolution}x{args.resolution}"
-        )
-        print(
-            "   This may cause poor results. Use --resolution 64 for proper evaluation!"
-        )
-        response = input("   Continue anyway? (y/n): ")
-        if response.lower() != "y":
-            print("Evaluation cancelled.")
-            exit()
+    # Override resolution to 64
+    print(f"\nRunning evaluation at 64x64 resolution (matching training)")
+    print(f"LoRA: {args.lora_path}")
+    print(f"Test data: {args.test_data_dir}")
+    print(f"Output: {args.output_dir}")
 
     evaluate_all_samples(args)
