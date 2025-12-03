@@ -104,7 +104,7 @@ def parse_args():
         "--num_train_epochs", type=int, default=10, help="Number of training epochs."
     )
     parser.add_argument(
-        "-- ",
+        "--max_train_steps",
         type=int,
         default=5000,  # Limited steps for 4 hours
         help="Total number of training steps to perform.",
@@ -305,7 +305,7 @@ class InpaintingDataset(Dataset):
 
         # Extract emoji_id for prompt
         emoji_id = base_name.split("__")[0]
-        prompt = f"a damaged picture of a single emoji"
+        prompt = f"a damaged picture of a single emoji that needs to be repaired"
 
         # Load images
         erased_image = Image.open(erased_path).convert("RGB")
