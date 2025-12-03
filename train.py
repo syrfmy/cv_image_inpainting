@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Optimized LoRA Training - Simplified Flow
+Optimized LoRA Training - Fixed Version
 """
 
 import argparse
@@ -51,7 +51,7 @@ def prepare_inpainting_inputs(erased_image, mask_image):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Optimized LoRA Training for Inpainting - Simplified Flow"
+        description="Optimized LoRA Training for Inpainting"
     )
 
     # Required arguments
@@ -74,7 +74,7 @@ def parse_args():
         help="The output directory where the model predictions and checkpoints will be written.",
     )
 
-    # Training parameters - OPTIMIZED FOR SPEED
+    # Training parameters
     parser.add_argument(
         "--resolution",
         type=int,
@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=4,
+        default=2,  # Reduced to avoid memory issues
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
@@ -93,7 +93,7 @@ def parse_args():
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=5000,
+        default=2000,  # Reduced for testing
         help="Total number of training steps to perform.",
     )
     parser.add_argument(
@@ -105,7 +105,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=2e-4,
+        default=1e-4,
         help="Initial learning rate.",
     )
     parser.add_argument(
@@ -121,9 +121,6 @@ def parse_args():
         help="Number of steps for the warmup in the lr scheduler.",
     )
     parser.add_argument(
-        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam."
-    )
-    parser.add_argument(
         "--seed", type=int, default=42, help="A seed for reproducible training."
     )
 
@@ -131,20 +128,14 @@ def parse_args():
     parser.add_argument(
         "--lora_rank",
         type=int,
-        default=32,
+        default=16,  # Reduced for speed
         help="Rank of LoRA layers.",
     )
     parser.add_argument(
         "--lora_alpha",
         type=int,
-        default=64,
+        default=32,
         help="Alpha parameter for LoRA scaling.",
-    )
-    parser.add_argument(
-        "--lora_dropout",
-        type=float,
-        default=0.1,
-        help="Dropout probability for LoRA layers.",
     )
 
     # System parameters
@@ -156,27 +147,9 @@ def parse_args():
         help="Whether to use mixed precision.",
     )
     parser.add_argument(
-        "--gradient_checkpointing",
-        action="store_true",
-        default=False,
-        help="Whether or not to use gradient checkpointing to save memory.",
-    )
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=int,
-        default=1000,
-        help="Save a checkpoint of the training state every X updates.",
-    )
-    parser.add_argument(
-        "--enable_xformers_memory_efficient_attention",
-        action="store_true",
-        default=True,
-        help="Whether or not to use xformers.",
-    )
-    parser.add_argument(
         "--num_workers",
         type=int,
-        default=4,
+        default=0,  # Set to 0 to avoid warnings
         help="Number of worker processes for data loading.",
     )
 
@@ -190,7 +163,7 @@ def parse_args():
 
 class InpaintingDataset(Dataset):
     """
-    Dataset for inpainting training with simplified flow.
+    Dataset for inpainting training.
     """
 
     def __init__(
@@ -217,7 +190,7 @@ class InpaintingDataset(Dataset):
         self.erased_files = sorted(list(self.erased_dir.glob("*_erased.png")))
         print(f"Found {len(self.erased_files)} training samples")
 
-        # Simple image transform - just resize and center crop
+        # Simple image transform
         self.transform = transforms.Compose(
             [
                 transforms.Resize(
@@ -233,14 +206,14 @@ class InpaintingDataset(Dataset):
     def __getitem__(self, index):
         # Get paths
         erased_path = self.erased_files[index]
-        filename = erased_path.stem  # e.g., "6__val_m00_erased"
-        base_name = filename.replace("_erased", "")  # e.g., "6__val_m00"
+        filename = erased_path.stem
+        base_name = filename.replace("_erased", "")
 
         mask_path = self.masks_dir / f"{base_name}_mask.png"
         orig_path = self.orig_dir / f"{base_name}.png"
 
         # Fixed prompt
-        prompt = "a picture of a single emoji"
+        prompt = "a damaged picture of a single emoji that needs to be repaired"
 
         # Load images
         erased_image = Image.open(erased_path).convert("RGB")
@@ -268,50 +241,45 @@ class InpaintingDataset(Dataset):
         }
 
 
-class CollateFn:
+def collate_fn(examples, tokenizer):
     """Collate function for the dataloader"""
+    # Tokenization
+    input_ids = [example["prompt_ids"] for example in examples]
+    input_ids = tokenizer.pad(
+        {"input_ids": input_ids}, padding=True, return_tensors="pt"
+    ).input_ids
 
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
+    # Prepare lists for tensors
+    orig_tensors = []
+    masks = []
+    erased_tensors = []
 
-    def __call__(self, examples):
-        """Collate function for the dataloader"""
-        # Tokenization
-        input_ids = [example["prompt_ids"] for example in examples]
-        input_ids = self.tokenizer.pad(
-            {"input_ids": input_ids}, padding=True, return_tensors="pt"
-        ).input_ids
+    for example in examples:
+        # Original image (ground truth)
+        orig_pil = example["orig_image"]
+        orig_np = np.array(orig_pil.convert("RGB"))
+        orig_np = orig_np.transpose(2, 0, 1)  # HWC to CHW
+        orig_tensor = torch.from_numpy(orig_np).float() / 127.5 - 1.0
+        orig_tensors.append(orig_tensor)
 
-        # Convert images to tensors
-        orig_tensors = []
-        mask_tensors = []
-        erased_tensors = []
+        # Prepare mask and erased image
+        mask, erased = prepare_inpainting_inputs(
+            example["erased_image"], example["mask"]
+        )
+        masks.append(mask.squeeze(0))  # Remove batch dimension
+        erased_tensors.append(erased.squeeze(0))  # Remove batch dimension
 
-        for example in examples:
-            # Original image for loss (ground truth)
-            orig_tensor = transforms.Normalize([0.5], [0.5])(
-                transforms.ToTensor()(example["orig_image"])
-            )
-            orig_tensors.append(orig_tensor)
+    # Stack tensors
+    orig_tensors = torch.stack(orig_tensors)
+    masks = torch.stack(masks)
+    erased_tensors = torch.stack(erased_tensors)
 
-            # Mask and erased image for input
-            mask, erased = prepare_inpainting_inputs(
-                example["erased_image"], example["mask"]
-            )
-            mask_tensors.append(mask)
-            erased_tensors.append(erased)
-
-        # Stack all tensors
-        orig_tensors = torch.stack(orig_tensors)
-        mask_tensors = torch.stack(mask_tensors)
-        erased_tensors = torch.stack(erased_tensors)
-
-        return {
-            "input_ids": input_ids,
-            "orig_images": orig_tensors,  # For loss calculation
-            "masks": mask_tensors,  # Where to inpaint
-            "erased_images": erased_tensors,  # Input image with damage
-        }
+    return {
+        "input_ids": input_ids,
+        "orig_images": orig_tensors,  # Shape: [B, 3, H, W]
+        "masks": masks,  # Shape: [B, 1, H, W]
+        "erased_images": erased_tensors,  # Shape: [B, 3, H, W]
+    }
 
 
 def main():
@@ -334,6 +302,7 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
 
     # Load tokenizer and models
+    print("Loading models...")
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer"
     )
@@ -360,24 +329,18 @@ def main():
         weight_dtype = torch.bfloat16
 
     # Move models to device
-    unet.to(accelerator.device, dtype=weight_dtype)
-    vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
-
-    # Enable xformers if requested
-    if args.enable_xformers_memory_efficient_attention:
-        from diffusers.utils.import_utils import is_xformers_available
-
-        if is_xformers_available():
-            unet.enable_xformers_memory_efficient_attention()
-            print("Enabled xformers memory efficient attention")
+    device = accelerator.device
+    unet.to(device, dtype=weight_dtype)
+    vae.to(device, dtype=weight_dtype)
+    text_encoder.to(device, dtype=weight_dtype)
 
     # Setup LoRA
+    print("Setting up LoRA...")
     lora_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
         target_modules=["to_q", "to_k", "to_v", "to_out.0"],
-        lora_dropout=args.lora_dropout,
+        lora_dropout=0.0,
         bias="none",
     )
     unet.add_adapter(lora_config)
@@ -406,20 +369,21 @@ def main():
     )
 
     # Load dataset
+    print("Loading dataset...")
     train_dataset = InpaintingDataset(
         data_root=args.train_data_dir,
         tokenizer=tokenizer,
         size=args.resolution,
     )
 
-    # Create dataloader
+    # Create dataloader with custom collate
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=CollateFn(tokenizer),
+        collate_fn=lambda x: collate_fn(x, tokenizer),
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=False,
     )
 
     # Setup scheduler
@@ -441,30 +405,40 @@ def main():
     )
 
     # Log info
-    logger.info(f"Starting training with {len(train_dataset)} samples")
-    logger.info(f"Target steps: {args.max_train_steps}")
-    logger.info(f"LoRA rank: {args.lora_rank}")
-    logger.info(f"Learning rate: {args.learning_rate}")
+    print(f"\nStarting training with {len(train_dataset)} samples")
+    print(f"Target steps: {args.max_train_steps}")
+    print(f"Batch size: {args.train_batch_size}")
+    print(f"LoRA rank: {args.lora_rank}")
+    print(f"Learning rate: {args.learning_rate}")
 
     # Training loop
     global_step = 0
     progress_bar = tqdm(
         range(global_step, args.max_train_steps),
+        desc="Training",
         disable=not accelerator.is_local_main_process,
     )
-    progress_bar.set_description("Steps")
 
     for epoch in range(args.num_train_epochs):
         unet.train()
 
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
+                # Debug: Print shapes
+                if global_step == 0:
+                    print(f"\nBatch shapes at step 0:")
+                    print(f"  orig_images: {batch['orig_images'].shape}")
+                    print(f"  masks: {batch['masks'].shape}")
+                    print(f"  erased_images: {batch['erased_images'].shape}")
+                    print(f"  input_ids: {batch['input_ids'].shape}")
+
                 # Get text embeddings
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-                # Convert images to latents
+                # Convert images to latents - FIXED VERSION
                 with torch.no_grad():
-                    # Target latents (original image) - for loss
+                    # Target latents (original image)
+                    # Ensure correct shape: [B, 3, H, W] -> [B, C, H, W]
                     target_latents = vae.encode(
                         batch["orig_images"].to(dtype=weight_dtype)
                     ).latent_dist.sample()
@@ -476,13 +450,19 @@ def main():
                     ).latent_dist.sample()
                     erased_latents = erased_latents * vae.config.scaling_factor
 
+                # Debug: Print latent shapes
+                if global_step == 0:
+                    print(f"\nLatent shapes at step 0:")
+                    print(f"  target_latents: {target_latents.shape}")
+                    print(f"  erased_latents: {erased_latents.shape}")
+
                 # Resize mask to latent size
-                mask = batch["masks"]
-                mask = torch.nn.functional.interpolate(
+                mask = batch["masks"].to(dtype=weight_dtype)
+                mask_resized = torch.nn.functional.interpolate(
                     mask,
                     size=(args.resolution // 8, args.resolution // 8),
                     mode="nearest",
-                ).to(dtype=weight_dtype)
+                )
 
                 # Sample noise
                 noise = torch.randn_like(target_latents)
@@ -501,13 +481,25 @@ def main():
                     target_latents, noise, timesteps
                 )
 
+                # Debug: Print shapes before concatenation
+                if global_step == 0:
+                    print(f"\nShapes before concatenation:")
+                    print(f"  noisy_latents: {noisy_latents.shape}")
+                    print(f"  mask_resized: {mask_resized.shape}")
+                    print(f"  erased_latents: {erased_latents.shape}")
+
                 # Concatenate for inpainting: [noisy_latents, mask, erased_latents]
-                model_input = torch.cat([noisy_latents, mask, erased_latents], dim=1)
+                model_input = torch.cat(
+                    [noisy_latents, mask_resized, erased_latents], dim=1
+                )
+
+                if global_step == 0:
+                    print(f"  model_input shape: {model_input.shape}")
 
                 # Predict noise
                 noise_pred = unet(model_input, timesteps, encoder_hidden_states).sample
 
-                # Calculate loss (target is the noise we added)
+                # Calculate loss
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
                 # Backward pass
@@ -521,25 +513,23 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
 
+                # Log loss
+                if global_step % 10 == 0:
+                    logs = {
+                        "loss": loss.detach().item(),
+                        "lr": lr_scheduler.get_last_lr()[0],
+                        "step": global_step,
+                    }
+                    progress_bar.set_postfix(logs)
+
                 # Save checkpoint
-                if (
-                    global_step % args.checkpointing_steps == 0
-                    and accelerator.is_main_process
-                ):
+                if global_step % 500 == 0 and accelerator.is_main_process:
                     save_path = os.path.join(
                         args.output_dir, f"checkpoint-{global_step}"
                     )
                     accelerator.save_state(save_path)
                     unet.save_attn_procs(os.path.join(save_path, "lora_weights"))
-                    logger.info(f"Saved checkpoint at step {global_step}")
-
-            # Log
-            logs = {
-                "loss": loss.detach().item(),
-                "lr": lr_scheduler.get_last_lr()[0],
-                "step": global_step,
-            }
-            progress_bar.set_postfix(**logs)
+                    print(f"\nSaved checkpoint at step {global_step}")
 
             if global_step >= args.max_train_steps:
                 break
@@ -553,18 +543,14 @@ def main():
         unet = unet.to(torch.float32)
         unet.save_attn_procs(args.output_dir)
 
-        # Save training summary
-        import json
+        # Also save as safetensors
+        from safetensors.torch import save_file
 
-        summary = {
-            "total_steps": global_step,
-            "total_params": total_params,
-            "lora_rank": args.lora_rank,
-            "learning_rate": args.learning_rate,
-            "dataset_size": len(train_dataset),
-        }
-        with open(os.path.join(args.output_dir, "training_summary.json"), "w") as f:
-            json.dump(summary, f, indent=2)
+        peft_state_dict = get_peft_model_state_dict(unet)
+        save_file(
+            peft_state_dict,
+            os.path.join(args.output_dir, "pytorch_lora_weights.safetensors"),
+        )
 
         print(f"Training completed in {global_step} steps")
         print(f"LoRA weights saved to {args.output_dir}")
