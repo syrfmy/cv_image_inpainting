@@ -40,9 +40,10 @@ def prepare_inpainting_inputs(erased_image, mask_image):
     erased_np = erased_np[None].transpose(0, 3, 1, 2)
     erased_tensor = torch.from_numpy(erased_np).to(dtype=torch.float32) / 127.5 - 1.0
 
-    # Convert mask: white=damage (1), black=intact (0)
+    # Convert mask: INVERT so black=damage (1), white=intact (0)
     mask_np = np.array(mask_image.convert("L"))
     mask_np = mask_np.astype(np.float32) / 255.0
+    mask_np = 1.0 - mask_np  # INVERT: black(0)->white(1), white(1)->black(0)
     mask_np = mask_np[None, None]  # Add batch and channel dims
     mask_tensor = torch.from_numpy(mask_np)
 
@@ -213,8 +214,7 @@ class InpaintingDataset(Dataset):
         orig_path = self.orig_dir / f"{base_name}.png"
 
         # Fixed prompt
-        prompt = "a damaged picture of a single emoji that needs to be repaired"
-
+        prompt = "a picture of a single emoji that needs to be repaired"
         # Load images
         erased_image = Image.open(erased_path).convert("RGB")
         mask_image = Image.open(mask_path).convert("L")

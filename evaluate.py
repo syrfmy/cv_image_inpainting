@@ -220,9 +220,10 @@ def evaluate_all_samples(args):
         image = image.resize(TARGET_SIZE, Image.LANCZOS)
         mask_image = mask_image.resize(TARGET_SIZE, Image.NEAREST)
         original_resized = original.resize(TARGET_SIZE, Image.LANCZOS)
+        mask_image_inverted = ImageOps.invert(mask_image)
 
         # Use training prompt
-        prompt = "a damaged picture of a single emoji that needs to be repaired"
+        prompt = "a picture of a single emoji that needs to be repaired"
 
         # Generate - FIX: Ensure pipeline uses correct size
         try:
@@ -230,7 +231,7 @@ def evaluate_all_samples(args):
             result = pipe(
                 prompt=prompt,
                 image=image,  # Already resized
-                mask_image=mask_image,  # Already resized
+                mask_image=mask_image_inverted,  # Already resized
                 num_inference_steps=args.num_steps,
                 guidance_scale=args.guidance_scale,
                 generator=torch.Generator(device).manual_seed(args.seed)
